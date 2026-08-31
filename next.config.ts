@@ -1,8 +1,6 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  // 배포 이미지를 최소 실행 파일만 담게 줄인다(아르고런처 배포, 2026-08-31).
-  output: "standalone",
   // dev 서버가 이제 -H 없이 0.0.0.0으로 뜨는데(컨테이너에서 접속 가능해야 해서), 그러면
   // 표준 호스트는 "localhost"가 되어 이 프로젝트가 계속 써온 "127.0.0.1"로 접속하면 HMR이
   // cross-origin으로 막힌다 — 127.0.0.1을 허용 목록에 추가해 그대로 쓸 수 있게 한다.
