@@ -1,0 +1,109 @@
+@import "tailwindcss";
+
+/* 토스(Toss) 스타일 디자인 토큰(2026-08-27, sol-mate와 동일한 방식) — accent를 토스 블루로,
+   반경 스케일을 한 단계씩 키움. pos/neg/warn(손익·입출금 등 회계 색상)은 의미가 있어서
+   그대로 둠 — 스타일 변경 대상은 accent·radius·카드 그림자. 시맨틱 토큰 이름은 그대로라
+   컴포넌트 코드를 거의 고칠 필요 없음. */
+:root {
+  --gray-10: #1a1a1a;
+  --gray-20: #333333;
+  --gray-30: #4d4d4d;
+  --gray-40: #666666;
+  --gray-50: #808080;
+  --gray-60: #999999;
+  --gray-70: #b3b3b3;
+  --gray-80: #cccccc;
+  --gray-90: #e6e6e6;
+  --gray-95: #f2f2f2;
+  --gray-99: #fafafa;
+
+  --bg: var(--gray-99);
+  --surface: #ffffff;
+  --border: var(--gray-90);
+  --fg: var(--gray-10);
+  --muted: var(--gray-50);
+
+  --accent: #5b9df8;
+  --accent-hover: #3182f6;
+  --accent-soft: #e8f3ff;
+  --accent-fg: #ffffff;
+
+  --pos: #2f6f4f;
+  --neg: #a23c34;
+  /* 제외(대조 대상 아님) 표시용. pos/neg와 같은 낮은 채도로 맞췄다 — 원색 노랑을 쓰면 이
+     팔레트에서 혼자 튀고, 초록(확정)·빨강(음수)과 나란히 있을 때 시선을 과하게 끈다. */
+  --warn: #8a6d1f;
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-border: var(--border);
+  --color-fg: var(--fg);
+  --color-muted: var(--muted);
+  --color-pos: var(--pos);
+  --color-neg: var(--neg);
+  --color-warn: var(--warn);
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-soft: var(--accent-soft);
+  --color-gray-10: var(--gray-10);
+  --color-gray-20: var(--gray-20);
+  --color-gray-30: var(--gray-30);
+  --color-gray-40: var(--gray-40);
+  --color-gray-50: var(--gray-50);
+  --color-gray-60: var(--gray-60);
+  --color-gray-70: var(--gray-70);
+  --color-gray-80: var(--gray-80);
+  --color-gray-90: var(--gray-90);
+  --color-gray-95: var(--gray-95);
+  --color-gray-99: var(--gray-99);
+
+  /* 토스는 전반적으로 더 둥근 모서리를 씀 — 기본 스케일을 한 단계씩 키움(rounded-md만 써도
+     이 앱 전역 버튼/인풋/카드가 자동으로 둥글어짐). */
+  --radius-xs: 0.25rem;
+  --radius-sm: 0.5rem;
+  --radius-md: 0.75rem;
+  --radius-lg: 1rem;
+  --radius-xl: 1.25rem;
+  --radius-2xl: 1.5rem;
+  --radius-3xl: 2rem;
+}
+
+html {
+  color-scheme: light;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Malgun Gothic",
+    "Apple SD Gothic Neo", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-2xl);
+  box-shadow:
+    0 1px 2px rgba(15, 23, 42, 0.04),
+    0 8px 24px rgba(15, 23, 42, 0.04);
+}
+
+.num {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+}
+
+button {
+  cursor: pointer;
+}
+
+button:not(:disabled),
+a {
+  transition:
+    background-color 0.15s ease,
+    opacity 0.15s ease,
+    filter 0.15s ease;
+}

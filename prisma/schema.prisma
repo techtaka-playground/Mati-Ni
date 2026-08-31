@@ -1,0 +1,518 @@
+// Mati-Ni — 포워더 정산시스템. Prisma 7 스키마 (Postgres — 2026-08-31 SQLite에서 전환,
+// 아르고런처 배포 플랫폼이 파일 기반 DB를 지원하지 않아서다. 로컬 개발도 로컬 Postgres를
+// 쓴다(운영과는 별도 인스턴스)).
+// 핵심 규칙:
+// - 매출(Sale)은 B/L번호(blNo) 기준 1건 = 1행. 손익 집계는 전부 Sale.date("매출 작성일자")
+//   기준으로 계산한다 (매입일자·대납일자는 집계 기준에 안 씀).
+// - 매입(Purchase)은 총액으로 등록하고, 그 총액을 관련된 B/L들에 사람이 직접 금액을 지정해
+//   배분한다(PurchaseAllocation) — 균등분배·비율계산 없음, 전부 수기입력.
+// - 매출과 매입 중 어느 쪽이 먼저 등록되든 상관없다. PurchaseAllocation은 B/L번호(blNo)를
+//   기준으로 저장되고, saleId는 그 번호와 일치하는 Sale이 있을 때만 채워진다(nullable).
+//   매입을 먼저 등록했는데 아직 그 B/L 매출이 없으면 saleId=null로 저장해두고, 나중에 그
+//   번호로 매출이 등록되는 순간 자동으로 연결된다(createSale에서 처리).
+// - 거래처(Party)는 매출처(고객)/매입처(공급자) 구분 없이 하나의 마스터로 통합 관리한다.
+// - 관세대납(CustomsAdvance)은 손익(매출-매입배분)에 포함되지 않는 별도의 자금흐름이다.
+//   특정 B/L을 대신해 관세를 먼저 납부하고, 이후 CustomsRecovery로 나눠서 회수한다.
+//   미회수잔액 = amount - sum(recoveries.amount). PurchaseAllocation과 같은 이유로 blNo가
+//   진짜 식별자이고 saleId는 nullable — 관세도 매출보다 먼저 등록될 수 있다.
+// - 매출(Sale)을 삭제하면 그 B/L에 걸린 매입배분·관세대납(및 그 회수내역)도 함께 삭제된다
+//   (매입 총액·거래처는 그대로 남고, 배분만 사라진다).
+// - User는 로그인 계정. role="admin"만 사용자 관리 화면에 접근 가능하고,
+//   canViewTaxInvoices로 세금계산서 탭 열람 권한을 계정별로 켜고 끈다.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// 로그인 계정. role="admin"만 사용자 관리 화면에 접근할 수 있고, canView* 값들로 탭별
+// 열람 권한을 계정마다 따로 설정한다(2026-08-27, 손익조회·일반전표·관세전표·거래처까지
+// 세금계산서·입출금내역과 같은 방식으로 확장).
+model User {
+  id                 String   @id @default(cuid())
+  email              String   @unique
+  passwordHash       String
+  role               String   @default("user") // "admin" | "user"
+  canViewPnl         Boolean  @default(false) // 손익조회
+  canViewVouchers    Boolean  @default(false) // 일반전표
+  canViewCustoms     Boolean  @default(false) // 관세전표
+  canViewTaxInvoices Boolean  @default(false) // 세금계산서
+  canViewBankLogs    Boolean  @default(false) // 입출금내역
+  canViewParties     Boolean  @default(false) // 거래처
+  createdAt          DateTime @default(now())
+}
+
+// 관리자가 만든 초대 — 이메일을 받은 사람이 /invite/{token}에서 직접 비밀번호를 정해 가입을
+// 완료하면 User가 생성되고 이 행은 지워진다. role/canView*는 초대 시점에 관리자가 미리
+// 정해두고, 가입 시 그대로 새 계정에 적용된다.
+model UserInvite {
+  id                 String   @id @default(cuid())
+  email              String   @unique
+  token              String   @unique
+  role               String   @default("user")
+  canViewPnl         Boolean  @default(false)
+  canViewVouchers    Boolean  @default(false)
+  canViewCustoms     Boolean  @default(false)
+  canViewTaxInvoices Boolean  @default(false)
+  canViewBankLogs    Boolean  @default(false)
+  canViewParties     Boolean  @default(false)
+  invitedByEmail     String
+  expiresAt          DateTime
+  createdAt          DateTime @default(now())
+}
+
+// 같은 그룹에 속한 이메일끼리는 세금계산서 담당자 열람 제한(Party.email)에서 서로의
+// 거래처 내역까지 볼 수 있다(2026-08-27, sol-mate의 이메일 그룹관리 기능 이식). 가입
+// 여부와 무관하게 이메일 문자열만으로 그룹에 넣을 수 있다.
+model EmailAccessGroup {
+  id        String             @id @default(cuid())
+  name      String? // 관리자용 라벨(선택) — 예: "물류팀"
+  members   EmailGroupMember[]
+  createdAt DateTime           @default(now())
+}
+
+model EmailGroupMember {
+  id      String           @id @default(cuid())
+  groupId String
+  group   EmailAccessGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  email   String // 소문자로 정규화해서 저장
+
+  @@unique([groupId, email])
+}
+
+// 거래처 마스터 (매출처/매입처 통합).
+model Party {
+  id           String   @id @default(cuid())
+  code         String?  @unique // 거래처 코드 — 순번(0001, 0002, ...), 세금계산서 자동등록 시 채번
+  name         String   @unique
+  bizNo        String?  @unique // 사업자등록번호 — 항상 000-00-00000 형식으로 저장(formatBizNo). 세금계산서 공급자/공급받는자 자동 매칭·등록 기준
+  contactName  String? // 담당자명
+  contactPhone String? // 담당자 연락처
+  email        String? // 담당자 이메일 — 이 거래처 관련 세금계산서를 볼 수 있는 사용자를 결정
+  note         String   @default("")
+  // "manual"이면 거래처 관리 화면에서 사람이 직접 등록한 것, "tax_invoice"면 세금계산서
+  // 조회/업로드나 PDF 인식으로 자동 등록/매칭된 것 — 삭제 가능 여부를 가른다(2026-08-27).
+  source       String   @default("tax_invoice")
+  createdAt    DateTime @default(now())
+
+  sales                     Sale[]
+  purchases                 Purchase[]
+  customsAdvances           CustomsAdvance[]
+  customsAdvancesAsPayee    CustomsAdvance[]          @relation("CustomsAdvancePayee")
+  bankAliases               BankPartyAlias[]
+  contactEditHistory        PartyContactEditHistory[]
+}
+
+// 바로빌에서 받아온 은행 거래를 로컬에 보관하는 표.
+//
+// 왜 저장하나: 입출금내역 자체는 조회할 때마다 바로빌에서 새로 받아오는 값이라, 다른 화면
+// (관세전표 등)에서 "이 청구에 해당하는 실제 입금/출금이 있나?"를 물어볼 방법이 없었다.
+// 화면을 열 때마다 바로빌을 부르면 계좌·기간마다 수 초씩 걸려 쓸 수 없다. 그래서 **입출금내역
+// 화면에서 조회할 때마다 그 결과를 여기 upsert**해두고, 다른 화면은 이 표만 읽는다.
+//
+// 그래서 **사용자가 한 번이라도 조회한 기간만** 다른 화면에서 매칭에 쓸 수 있다 — 조회하지
+// 않은 기간은 매칭이 비어 보인다(화면에서 그 사실을 알려준다).
+//
+// 키는 은행 거래고유번호(TransRefKey)다 — 같은 기간을 여러 번 조회해도 중복되지 않는다.
+model BankTransaction {
+  id          String   @id @default(cuid())
+  transRefKey String   @unique
+  accountNum  String
+  transDT     String // YYYYMMDDHHMMSS
+  deposit     Float
+  withdraw    Float
+  balance     Float
+  transType   String   @default("")
+  transOffice String   @default("")
+  transRemark String   @default("") // 송금인/적요 — 거래처 매칭의 기준
+  mgtRemark   String   @default("")
+  syncedAt    DateTime @default(now())
+
+  @@index([accountNum, transDT])
+  // 금액으로 청구액과 맞춰보는 조회가 많아서 인덱스를 둔다.
+  @@index([deposit])
+  @@index([withdraw])
+}
+
+// 은행 입출금내역 한 건의 **검토 상태**를 표시해두는 표.
+//
+// 입출금내역 자체는 바로빌에서 매번 새로 받아오는 값이라 DB에 없다 — 그래서 "이 건을 어떻게
+// 처리했는지"만 따로 저장한다. 키는 **거래 1건을 고유하게 가리키는 TransRefKey**다(은행이 매긴
+// 번호라 조회를 다시 해도 같은 값이 온다).
+//
+// status는 두 가지다(행이 아예 없으면 "미확정"):
+//   confirmed — 내용을 확인했다.
+//   excluded  — 대조 대상이 아니다(이자, 내부 이체 등). **미확정 집계에서 빠진다** — 이게 제외의
+//               목적이다. 볼 필요 없는 건이 미확정 더미에 계속 남아 있으면 "몇 개 남았는지"가
+//               의미를 잃는다.
+//
+// 세금계산서의 승인/확정과 달리 **되돌릴 수 있다**(해제). 저건 전표를 만드는 행위라 취소하면
+// 데이터가 사라지지만, 이건 검토 표시일 뿐이어서 잘못 눌렀을 때 풀 수 있어야 한다.
+//
+// 테이블 이름은 처음 만들 때의 "확정"만 담던 시절 이름이다 — 이름을 바꾸면 기존 데이터를 잃으므로
+// 컬럼만 추가했다. confirmedBy/At은 두 상태 모두 "누가 언제 이 상태로 표시했는지"를 뜻한다.
+model BankTransactionConfirm {
+  id               String   @id @default(cuid())
+  transRefKey      String   @unique // 은행 거래고유번호
+  accountNum       String // 어느 계좌의 거래였는지(조회 편의용)
+  transDT          String // 거래일시 YYYYMMDDHHMMSS — 나중에 기간별로 현황을 볼 때 쓴다
+  amount           Float // 표시 당시 금액(입금은 +, 출금은 -) — 값이 달라지면 알아챌 수 있게 남긴다
+  status           String   @default("confirmed") // "confirmed" | "excluded"
+  reason           String   @default("") // 제외 사유(선택) — 왜 대조 대상이 아닌지 적어둘 수 있다
+  confirmedByEmail String
+  confirmedAt      DateTime @default(now())
+
+  @@index([accountNum, transDT])
+  @@index([status])
+}
+
+// 은행 입출금내역의 "송금인/적요"(TransRemark) 문자열을 거래처에 연결해두는 표.
+//
+// 왜 필요한가: 은행 거래내역에는 상대 계좌번호도 사업자번호도 없고 입금자명만 온다. 그 이름은
+// 거래처 마스터와 표기가 자주 다르다(`(주)앱솔브랩` vs `앱솔브랩`, `주)신세계인터내셔날`처럼
+// 괄호가 깨져 오기도 한다). 그래서 이름을 정규화해 자동으로 추정하고, 추정이 틀리면 사람이
+// 한 번 지정하게 한다 — 그 지정을 여기 저장해 **같은 송금인의 다음 거래에도 자동 적용**한다.
+//
+// 키를 거래 1건(TransRefKey)이 아니라 **송금인 이름(정규화)** 으로 잡은 이유: 같은 거래처에서
+// 입금이 반복되는데 거래마다 다시 지정하게 하면 쓸 수 없다.
+model BankPartyAlias {
+  id         String   @id @default(cuid())
+  normalized String   @unique // 정규화한 송금인 문자열(normalizeRemarkForMatch)
+  raw        String // 지정할 때 화면에 보였던 원본 문자열 — 나중에 왜 이렇게 매핑됐는지 되짚기 위함
+  partyId    String
+  createdAt  DateTime @default(now())
+
+  party Party @relation(fields: [partyId], references: [id], onDelete: Cascade)
+
+  @@index([partyId])
+}
+
+// 은행거래 ↔ 전표(매출/매입배분/관세대납) 사이의 실제 배분(얼마를 그 거래로 채웠는지).
+//
+// 예전에는 이 연결을 저장하지 않고 "금액이 똑같은 거래가 있나"를 매번 그 자리에서 계산만
+// 했다(bankMatch.ts createBankMatcher) — 그래서 금액이 정확히 안 맞는 부분입금·분할출금은
+// 아예 표현할 수 없었고, 사람이 "이게 그 거래다"라고 직접 지정할 방법도 없었다. 이제는
+// 배분을 여기 저장한다 — 은행거래 하나가 여러 전표에 나뉘어 배분되거나(예: 한 번에
+// 100만원 입금됐지만 매출 B/L 여러 건에 걸쳐 있음), 전표 하나가 여러 은행거래에 걸쳐
+// 채워질 수 있는 M:N 관계다(2026-08-31).
+//
+// kind+targetId로 가리키고 관계(FK)로 묶지 않는 이유는 VoucherConfirmHistory와 같다 —
+// 여러 모델(Sale/PurchaseAllocation/CustomsAdvance)에 걸쳐 있어서다. "전표 단위"는
+// 종류마다 가장 세분화된 단위를 쓴다: 매출은 Sale, 매입은 PurchaseAllocation(B/L별
+// 배분), 관세대납은 CustomsAdvance.
+model BankAllocation {
+  id             String   @id @default(cuid())
+  transRefKey    String // BankTransaction.transRefKey
+  kind           String // "sale" | "purchaseAllocation" | "customsAdvance"
+  targetId       String // Sale.id | PurchaseAllocation.id | CustomsAdvance.id
+  amount         Float // 이 연결에 배분된 금액(은행거래 전체나 전표 전체 금액이 아니라 이 배분 몫)
+  auto           Boolean  @default(false) // 자동 매칭으로 생성됐는지(수기 배분과 구분해 표시)
+  createdByEmail String
+  createdAt      DateTime @default(now())
+
+  @@index([transRefKey])
+  @@index([kind, targetId])
+}
+
+// 거래처 담당자 정보(담당자명·연락처·이메일)를 고칠 때마다 남는 이력. 아무것도 없던 상태에서
+// 처음 채우는 건 "초기설정"(isInitial=true, 사유 입력 불필요)으로 기록하고, 그 뒤 수정은
+// 사유를 반드시 받는다. **수정 전 값을 그대로 남겨야** 나중에 무엇이 어떻게 바뀌었는지
+// 되짚을 수 있으므로 previous*/new* 양쪽을 다 저장한다(이메일은 세금계산서 열람권한을
+// 좌우하는 값이라 변경 추적이 특히 중요하다).
+model PartyContactEditHistory {
+  id                   String   @id @default(cuid())
+  partyId              String
+  previousContactName  String?
+  previousContactPhone String?
+  previousEmail        String?
+  newContactName       String?
+  newContactPhone      String?
+  newEmail             String?
+  reason               String // 초기설정이면 "초기설정"
+  isInitial            Boolean  @default(false)
+  changedByEmail       String
+  createdAt            DateTime @default(now())
+
+  party Party @relation(fields: [partyId], references: [id], onDelete: Cascade)
+
+  @@index([partyId])
+}
+
+// 매출 1건 = B/L 1건.
+model Sale {
+  id         String   @id @default(cuid())
+  blNo       String // B/L번호
+  date       DateTime // 매출 작성일자 — 월별/BL별/거래처별 손익 집계 기준
+  partyId    String
+  amount     Float // 매출액(KRW)
+  note       String   @default("")
+  ntsSendKey String? // 세금계산서에서 등록됐으면 그 승인번호 — 있으면 전표에서 수정 불가
+  confirmedAt DateTime? // 세금계산서 화면에서 "확정"을 누른 시각 — 있으면 B/L 수정 시 사유+이력이 필요해진다
+  // 일반전표의 "입출금 완료(1단계) → 확정(2단계)" 흐름 전용 필드. 위 confirmedAt(세금계산서
+  // B/L 수정 잠금용)과는 다른 개념이라 이름을 분리했다 — 은행 매칭으로 입금 완료가 잡힌 뒤,
+  // 사람이 최종 검토하고 눌러야 값이 찬다. 값이 있으면 관리자가 해제하기 전까지 수정·삭제가
+  // 막힌다(2026-08-27).
+  settlementConfirmedAt      DateTime?
+  settlementConfirmedByEmail String?
+  createdAt  DateTime @default(now())
+
+  party       Party                @relation(fields: [partyId], references: [id])
+  allocations PurchaseAllocation[]
+  customsAdvances CustomsAdvance[]
+  blEditHistory SaleBlEditHistory[]
+
+  @@index([blNo])
+  @@index([date])
+  @@index([partyId])
+}
+
+// 매입 1건 (총액 단위로 등록, 배분은 PurchaseAllocation에서 처리).
+model Purchase {
+  id         String   @id @default(cuid())
+  date       DateTime // 매입일자
+  partyId    String
+  amount     Float // 매입 총액(KRW)
+  note       String   @default("")
+  ntsSendKey String? // 세금계산서에서 등록됐으면 그 승인번호(묶음이면 대표 1건) — 있으면 전표에서 수정 불가
+  createdAt  DateTime @default(now())
+
+  party       Party                @relation(fields: [partyId], references: [id])
+  allocations PurchaseAllocation[]
+
+  @@index([date])
+  @@index([partyId])
+}
+
+// 매입 총액을 B/L별로 사람이 직접 배분한 금액. blNo가 항상 진짜 식별자이고, saleId는 그
+// blNo와 일치하는 Sale이 등록된 뒤에만 채워지는 파생 연결이다(매입이 매출보다 먼저 와도 됨).
+model PurchaseAllocation {
+  id         String  @id @default(cuid())
+  purchaseId String
+  blNo       String // 이 배분이 속한 B/L 번호 (saleId 매칭 여부와 무관하게 항상 존재). 세금계산서
+  // 미발행분처럼 특정 B/L에 속하지 않는 줄은 빈 문자열이다 — 그러면 어떤 Sale과도 매칭되지
+  // 않아 B/L별 손익에 섞이지 않는다.
+  saleId     String? // blNo와 일치하는 Sale이 있으면 그 id, 없으면 null(미매칭)
+  amount     Float // 이 B/L에 배분된 매입 금액
+  // 이 줄이 무엇인지 나타내는 명칭. 보통은 빈 값(세금계산서 대상 금액)이고, 인보이스 합계가
+  // 세금계산서 합계금액과 다를 때 그 차액 줄에 "부가세"·"영세율"·"면세"·"해외운임" 등이 들어간다.
+  // 배분 줄마다 명칭이 필요해서 Purchase.note가 아니라 여기에 둔다(한 전표에 여러 종류가 섞임).
+  label      String  @default("")
+  // 일반전표의 "출금 완료(1단계) → 확정(2단계)" 흐름 — Sale의 같은 이름 필드와 용도가 같다.
+  // 예전엔 Purchase 전체에 하나만 뒀는데, 매입 한 건이 여러 B/L로 나뉘면 그중 일부만 먼저
+  // 출금되는 경우를 표현할 수 없어서 B/L별 배분(이 모델) 단위로 내렸다(2026-08-31).
+  settlementConfirmedAt      DateTime?
+  settlementConfirmedByEmail String?
+
+  purchase Purchase @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
+  sale     Sale?    @relation(fields: [saleId], references: [id], onDelete: Cascade)
+
+  @@index([purchaseId])
+  @@index([saleId])
+  @@index([blNo])
+}
+
+// 관세 대납 — 손익과 무관한 별도 자금흐름(선지급 후 회수). blNo가 진짜 식별자이고, saleId는
+// 그 blNo와 일치하는 Sale이 등록된 뒤에만 채워지는 파생 연결이다(관세가 매출보다 먼저 와도 됨).
+model CustomsAdvance {
+  id        String   @id @default(cuid())
+  blNo      String // 대납한 B/L 번호 (saleId 매칭 여부와 무관하게 항상 존재)
+  saleId    String? // blNo와 일치하는 Sale이 있으면 그 id, 없으면 null(미매칭)
+  // 이 관세대납의 거래처. 예전에는 거래처를 아예 두지 않고 B/L로 연결된 매출의 거래처를
+  // 빌려 보여줬는데, 그러면 매출이 아직 없는 대납은 거래처를 적어둘 방법이 없었다.
+  // 선택 항목이고(옛 데이터는 null), **거래처 마스터에 이미 있는 거래처만** 지정할 수 있다.
+  // onDelete: Restrict — 관세전표가 쓰고 있는 거래처는 실수로 지워지지 않아야 한다.
+  partyId   String?
+  // **지급처** — 실제로 이 대납금을 받는 대상(관세사·포워더 등). partyId(회수 대상 고객사)와는
+  // 완전히 다른 회사다: 관세대납은 "고객사에게서 나중에 회수"할 돈과 "관세사/포워더에게 지금
+  // 지급"할 돈이 서로 다른 상대라서, 입금은 partyId로 찾고 출금은 이 값으로 찾아야 한다
+  // (bankMatch.ts getBankTransactionLinks·lib/customs.ts 참고 — partyId만 쓰던 예전 버전은
+  // 지급처가 회수 대상과 다른 실거래에서 출금 매칭이 항상 실패했다). 세금계산서에서 관세전표로
+  // 등록하면 그 세금계산서의 공급자를 자동으로 채운다(그게 곧 지급처다) — 수기 등록은 선택 입력.
+  payeePartyId String?
+  // 세금계산서 화면에서 "관세전표"로 등록됐으면 그 승인번호(묶음이면 대표 1건). 직접 입력한
+  // 건은 null이다. 두 가지에 쓴다:
+  //  ① 목록의 "등록" 열에 세금계산서 관리번호(O00001 등)를 보여준다.
+  //  ② 같은 세금계산서를 두 번 등록하는 것을 막는다(findDuplicateVoucherMessage) — 예전에는
+  //     이 컬럼이 없어서 관세전표로 등록한 건에는 그 가드가 적용되지 않았다.
+  ntsSendKey String?
+  paidDate  DateTime
+  amount    Float // 대납액
+  note      String   @default("")
+  // 대납(출금) 쪽의 "출금 완료(1단계) → 확정(2단계)" 흐름 — Sale/PurchaseAllocation과 같은
+  // 이름·용도. 회수(입금) 쪽은 이번 범위 밖이라 별도 확정 필드를 두지 않는다(2026-08-31).
+  settlementConfirmedAt      DateTime?
+  settlementConfirmedByEmail String?
+  createdAt DateTime @default(now())
+
+  sale       Sale?             @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  party      Party?            @relation(fields: [partyId], references: [id], onDelete: Restrict)
+  payeeParty Party?            @relation("CustomsAdvancePayee", fields: [payeePartyId], references: [id], onDelete: Restrict)
+  recoveries CustomsRecovery[]
+
+  @@index([saleId])
+  @@index([blNo])
+  @@index([partyId])
+  @@index([payeePartyId])
+  @@index([ntsSendKey])
+}
+
+// 세금계산서 한 건(ntsSendKey)에 첨부한 실제 인보이스 PDF. blNo는 그 PDF에서 Claude로
+// 추출한 값이며, 매출/매입 매칭 여부는 저장하지 않고 조회 시점에 Sale/PurchaseAllocation을
+// blNo로 다시 확인한다(다른 blNo 매칭들과 같은 이유 — 나중에 매출이 등록돼도 반영되게).
+model TaxInvoiceAttachment {
+  id         String   @id @default(cuid())
+  ntsSendKey String   @unique // 세금계산서 국세청 승인번호 — 이 첨부의 진짜 식별자
+  direction  String // "sales" | "purchase" — 어느 목록에서 첨부했는지
+  blNo       String? // 인보이스에서 추출된 B/L (추출 실패 시 null)
+  fileName   String // uploads/ 안에 저장된 파일명
+  // 확인/승인 팝업에서 "승인"을 눌러 전표(일반전표/관세전표)에 등록한 시각. 매출·매입 공통으로
+  // 여기 둔다 — Sale/Purchase/CustomsAdvance 각각에 따로 두면 같은 개념이 세 곳에 흩어진다.
+  // 값이 있으면 목록에서 그 행이 초록 음영으로 표시되고 "수정"만 할 수 있다.
+  approvedAt DateTime?
+  createdAt  DateTime @default(now())
+
+  editHistory TaxInvoiceEditHistory[]
+}
+
+// 승인된 세금계산서를 나중에 고칠 때마다 남는 이력(매출·매입 공통). B/L과 첨부파일 둘 다
+// 바꿀 수 있고, **수정 전/후 값과 사유를 반드시 남긴다** — 승인까지 끝난 건을 바꾸는 것이라
+// 무엇이 왜 바뀌었는지 되짚을 수 있어야 한다.
+model TaxInvoiceEditHistory {
+  id               String   @id @default(cuid())
+  ntsSendKey       String
+  previousBlNo     String?
+  newBlNo          String?
+  previousFileName String?
+  newFileName      String?
+  // "금액 조정"(B/L은 그대로 두고 금액만 고치는 수정, 2026-08-27 추가) 전용 — B/L 변경
+  // 이력에서는 항상 null, 금액 조정 이력에서는 항상 값이 있다. 여러 B/L로 나뉜 등록이면
+  // 그 합계(수정 대상 B/L들의 조정 전/후 합)를 남긴다.
+  previousAmount   Float?
+  newAmount        Float?
+  reason           String
+  changedByEmail   String
+  createdAt        DateTime @default(now())
+
+  attachment TaxInvoiceAttachment @relation(fields: [ntsSendKey], references: [ntsSendKey], onDelete: Cascade)
+
+  @@index([ntsSendKey])
+}
+
+// 일반전표의 "확정"/"확정 해제" 이력(매출·매입 공통, kind로 구분). voucherId는 Sale.id
+// 또는 PurchaseAllocation.id(B/L 단위 확정, 2026-08-31부터) — 관계로 묶지 않는 이유는
+// TaxInvoiceEditHistory와 달리 두 모델에 걸쳐 있어서다. 확정 해제는 관리자만 할 수 있고
+// 사유가 필수라 그 사유를 여기 남긴다(확정 자체는 사유가 없다 — 정상적인 1단계→2단계
+// 진행이라 되돌림이 아니다).
+model VoucherConfirmHistory {
+  id        String   @id @default(cuid())
+  kind      String // "sale" | "purchaseAllocation"
+  voucherId String
+  action    String // "confirm" | "unconfirm"
+  byEmail   String
+  reason    String   @default("")
+  createdAt DateTime @default(now())
+
+  @@index([kind, voucherId])
+}
+
+// 관리자가 아닌 사용자는 확정된 전표를 직접 해제할 수 없고, 대신 사유를 남겨 해제를
+// "요청"한다 — 관리자가 승인하면 그때 실제로 해제된다(2026-08-31). 한 전표에 대기 중인
+// 요청은 항상 최대 1건만 있어야 한다(중복 요청 방지는 액션에서 확인).
+model VoucherUnconfirmRequest {
+  id               String    @id @default(cuid())
+  kind             String // "sale" | "purchaseAllocation"
+  voucherId        String
+  reason           String
+  status           String    @default("pending") // "pending" | "approved" | "rejected"
+  requestedByEmail String
+  createdAt        DateTime  @default(now())
+  decidedByEmail   String?
+  decidedAt        DateTime?
+  // 거절 사유(필수) — 왜 거절했는지 남겨야 요청한 사람이 다시 요청할 때 참고할 수 있다
+  // (2026-08-31). 승인은 별도 사유가 없다 — VoucherConfirmHistory에 이미 남는다.
+  decisionNote     String?
+
+  @@index([kind, voucherId])
+  @@index([status])
+}
+
+// 홈택스 엑셀 업로드로 들어온 세금계산서 원본 데이터. 새로고침해도 남아있어야 해서
+// (바로빌 API 조회 결과와 달리 엑셀은 다시 올리지 않는 한 재현할 방법이 없다) 저장한다.
+// ntsSendKey(국세청 승인번호)가 진짜 식별자라 같은 파일을 다시 올려도 덮어쓸 뿐 중복되지
+// 않는다. 일반 "조회"를 실행하면 바로빌 API 결과와 이 저장분을 승인번호 기준으로 합쳐서
+// 보여준다(src/lib/taxInvoiceRecords.ts).
+model TaxInvoiceRecord {
+  id                  String   @id @default(cuid())
+  ntsSendKey          String   @unique
+  direction           String // "sales" | "purchase"
+  writeDate           String // YYYYMMDD
+  issueDT             String
+  counterpartCorpNum  String
+  counterpartCorpName String
+  counterpartCEOName  String
+  amountTotal         Float
+  taxTotal            Float
+  totalAmount         Float
+  itemName            String
+  remark1             String
+  modifyCode          String
+  createdAt           DateTime @default(now())
+
+  @@index([direction, writeDate])
+}
+
+// 세금계산서 화면에서 "확정"된 매출의 B/L을 나중에 고칠 때마다 남는 이력 — 확정 전에는
+// B/L을 자유롭게 고칠 수 있어 이력을 남기지 않고, 확정 후부터는 사유를 반드시 적어야
+// 수정할 수 있다(editConfirmedSaleBlNo). 거래처·금액·날짜는 세금계산서 원본 값이라 이
+// 화면의 수정 대상이 아니다 — B/L만 대상.
+model SaleBlEditHistory {
+  id             String   @id @default(cuid())
+  saleId         String
+  previousBlNo   String
+  newBlNo        String
+  reason         String
+  changedByEmail String
+  createdAt      DateTime @default(now())
+
+  sale Sale @relation(fields: [saleId], references: [id], onDelete: Cascade)
+
+  @@index([saleId])
+}
+
+// 세금계산서마다 부여하는 내부 관리번호 — 매출은 I00001, 매입은 O00001부터 방향별로 각각
+// 순번을 매긴다(I=Income/매출, O=Outcome/매입). 세금계산서 자체는 바로빌 API로 매번 새로
+// 조회하는 것이라(DB에 안 남는다) 승인번호(ntsSendKey)를 키로 번호만 여기 붙여둔다.
+//
+// **한 번 부여된 번호는 절대 바뀌지 않는다** — 관리번호가 도중에 달라지면 그 번호로 남겨둔
+// 다른 기록(메모·결의서 등)과 어긋나기 때문이다. 그래서 번호는 "그 세금계산서가 조회에 처음
+// 등장한 시점"에 부여되고, 한 번의 조회 안에서는 작성일자 순으로 매긴다. 오래된 월을 나중에
+// 조회하면 그 건들이 더 큰 번호를 받는 건 이 규칙의 당연한 결과다.
+model TaxInvoiceSeq {
+  id         String   @id @default(cuid())
+  ntsSendKey String   @unique // 국세청 승인번호 — 세금계산서의 진짜 식별자
+  direction  String // "sales" | "purchase"
+  seq        Int // 방향별 순번 (1부터)
+  number     String   @unique // 표시용 번호: "I00001" / "O00001"
+  createdAt  DateTime @default(now())
+
+  @@unique([direction, seq])
+  @@index([direction])
+}
+
+// 관세대납금 회수 내역 (분할 회수 가능).
+model CustomsRecovery {
+  id               String   @id @default(cuid())
+  customsAdvanceId String
+  date             DateTime
+  amount           Float
+  note             String   @default("")
+  createdAt        DateTime @default(now())
+
+  customsAdvance CustomsAdvance @relation(fields: [customsAdvanceId], references: [id], onDelete: Cascade)
+
+  @@index([customsAdvanceId])
+}

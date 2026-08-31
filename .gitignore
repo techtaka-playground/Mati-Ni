@@ -1,0 +1,10 @@
+/node_modules
+/.next
+/out
+/build
+*.log
+.env
+dev.db*
+/src/generated
+/uploads*
+*.tsbuildinfo
