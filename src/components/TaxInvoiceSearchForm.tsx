@@ -300,6 +300,7 @@ const CSV_HEADERS = [
   "거래처명",
   "사업자번호",
   "대표자",
+  "거래처 이메일",
   "공급가액",
   "세액",
   "합계금액",
@@ -329,6 +330,7 @@ function downloadTaxInvoicesCsv(
         r.counterpartCorpName,
         formatBizNo(r.counterpartCorpNum),
         r.counterpartCEOName,
+        r.counterpartEmail,
         r.amountTotal,
         r.taxTotal,
         r.totalAmount,
@@ -1888,6 +1890,9 @@ export function TaxInvoiceSearchForm({
         </td>
         <td className="py-2 pr-3 text-fg">{r.counterpartCorpName}</td>
         <td className="py-2 pr-3 whitespace-nowrap num text-muted">{formatBizNo(r.counterpartCorpNum)}</td>
+        <td className="max-w-[160px] truncate py-2 pr-3 text-muted" title={r.counterpartEmail || undefined}>
+          {r.counterpartEmail || "-"}
+        </td>
         <td className="py-2 pr-3 text-right num text-fg">{formatAmount(r.amountTotal)}</td>
         <td className="py-2 pr-3 text-right num text-muted">{formatAmount(r.taxTotal)}</td>
         <td className="py-2 pr-3 text-right num font-medium text-fg">{formatAmount(r.totalAmount)}</td>
@@ -2056,6 +2061,9 @@ export function TaxInvoiceSearchForm({
           <td className="py-2 pr-3 whitespace-nowrap num text-muted">
             {formatBizNo(first.counterpartCorpNum)}
           </td>
+          <td className="max-w-[160px] truncate py-2 pr-3 text-muted" title={first.counterpartEmail || undefined}>
+            {first.counterpartEmail || "-"}
+          </td>
           <td className="py-2 pr-3 text-right num text-fg">{formatAmount(sum.amountTotal)}</td>
           <td className="py-2 pr-3 text-right num text-muted">{formatAmount(sum.taxTotal)}</td>
           <td className="py-2 pr-3 text-right num font-medium text-fg">{formatAmount(sum.totalAmount)}</td>
@@ -2165,7 +2173,7 @@ export function TaxInvoiceSearchForm({
             보이게 한다 — 표라 margin을 못 쓰니 테두리 없는 빈 행으로 높이만 흉내낸다. 접혀
             있을 때도(대표행 한 줄만 보일 때도) 다음 건과는 살짝 떨어져 보이도록 항상 넣는다. */}
         <tr aria-hidden="true">
-          <td colSpan={16} className="h-2" />
+          <td colSpan={17} className="h-2" />
         </tr>
       </Fragment>
     );
@@ -2369,6 +2377,9 @@ export function TaxInvoiceSearchForm({
                   onSort={handleSort}
                 />
                 <SortableTh label="사업자번호" sortKey="counterpartCorpNum" state={sort} onSort={handleSort} />
+                {/* 바로빌 조회로 받은 건에만 있다(엑셀 업로드본·저장된 기록에는 없어 "-") — 정렬
+                    대상에서 뺀 이유도 같다. */}
+                <th className="py-2 pr-3">거래처 이메일</th>
                 <SortableTh label="공급가액" sortKey="amountTotal" state={sort} onSort={handleSort} align="right" />
                 <SortableTh label="세액" sortKey="taxTotal" state={sort} onSort={handleSort} align="right" />
                 <SortableTh label="합계금액" sortKey="totalAmount" state={sort} onSort={handleSort} align="right" />
@@ -2385,7 +2396,7 @@ export function TaxInvoiceSearchForm({
             <tbody>
               {/* 헤더와 첫 줄 사이도 다른 줄 사이 간격과 똑같이 살짝 띄운다. */}
               <tr aria-hidden="true">
-                <td colSpan={16} className="h-2" />
+                <td colSpan={17} className="h-2" />
               </tr>
               {buildDisplayItems().map((item) =>
                 item.kind === "single" ? (
@@ -2395,7 +2406,7 @@ export function TaxInvoiceSearchForm({
                   <Fragment key={item.row.ntsSendKey}>
                     {renderDataRow(item.row)}
                     <tr aria-hidden="true">
-                      <td colSpan={16} className="h-2" />
+                      <td colSpan={17} className="h-2" />
                     </tr>
                   </Fragment>
                 ) : (

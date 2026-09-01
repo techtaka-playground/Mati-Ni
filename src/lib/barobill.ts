@@ -26,6 +26,10 @@ export type TaxInvoiceRow = {
   // 값인데 지금까지 읽지 않고 버리고 있었다(2026-08-31, sol-mate가 같은 API 응답에서
   // 이 필드를 쓰는 걸 보고 확인함). 거래처 담당자 이메일(열람권한)을 자동으로 채우는 데 쓴다.
   ourStaffEmail: string;
+  // 상대 거래처 쪽 이메일 — ourStaffEmail과 반대 방향(매출이면 공급받는자의 InvoiceeEmail,
+  // 매입이면 공급자의 InvoicerEmail). 목록 화면에 그대로 보여주는 용도라 party 자동채움 같은
+  // 내부 로직에는 쓰지 않는다. 엑셀 업로드본/저장된 기록에는 없어 빈 값으로 온다.
+  counterpartEmail: string;
 };
 
 let clientPromise: Promise<soap.Client> | null = null;
@@ -91,6 +95,8 @@ function toRow(raw: Record<string, unknown>, direction: TaxInvoiceDirection): Ta
     modifyCode: s(raw.ModifyCode),
     // 매출은 우리가 공급자(Invoicer), 매입은 우리가 공급받는자(Invoicee)다.
     ourStaffEmail: direction === "sales" ? s(raw.InvoicerEmail) : s(raw.InvoiceeEmail),
+    // 상대방은 그 반대 — 매출이면 상대가 공급받는자(Invoicee), 매입이면 상대가 공급자(Invoicer).
+    counterpartEmail: direction === "sales" ? s(raw.InvoiceeEmail) : s(raw.InvoicerEmail),
   };
 }
 

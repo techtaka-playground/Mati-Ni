@@ -10,6 +10,7 @@
 //
 // 비밀번호는 앱 로그인과 똑같이 bcrypt로 해시해서 저장한다(src/lib/auth.ts와 동일한 방식).
 
+import "dotenv/config";
 import bcrypt from "bcryptjs";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "../src/generated/prisma/client";

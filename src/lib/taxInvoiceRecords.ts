@@ -30,6 +30,7 @@ function toRow(record: {
     modifyCode: record.modifyCode,
     // 저장된 업로드 기록엔 담당자 이메일 칸이 없다(saveTaxInvoiceRecords 참고).
     ourStaffEmail: "",
+    counterpartEmail: "",
   };
 }
 
@@ -39,9 +40,9 @@ export async function saveTaxInvoiceRecords(
   rows: TaxInvoiceRow[]
 ): Promise<void> {
   for (const r of rows) {
-    // ourStaffEmail은 TaxInvoiceRecord에 칸이 없다 — 엑셀 업로드본에는 항상 빈 값이라
-    // 저장할 이유도 없다(toRow에서 다시 ""로 채워 돌려준다).
-    const { ourStaffEmail: _ourStaffEmail, ...record } = r;
+    // ourStaffEmail/counterpartEmail은 TaxInvoiceRecord에 칸이 없다 — 엑셀 업로드본에는
+    // 항상 빈 값이라 저장할 이유도 없다(toRow에서 다시 ""로 채워 돌려준다).
+    const { ourStaffEmail: _ourStaffEmail, counterpartEmail: _counterpartEmail, ...record } = r;
     await prisma.taxInvoiceRecord.upsert({
       where: { ntsSendKey: r.ntsSendKey },
       create: { ...record, direction },

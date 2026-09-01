@@ -55,6 +55,7 @@ export function parseHometaxTaxInvoiceExcel(buffer: Buffer): ParsedTaxInvoiceExc
     modifyCode: "0",
     // 홈택스 엑셀 다운로드에는 담당자 이메일 칸이 없다 — API 조회로 받은 건만 채워진다.
     ourStaffEmail: "",
+    counterpartEmail: "",
   }));
 
   if (result.length === 0) {
