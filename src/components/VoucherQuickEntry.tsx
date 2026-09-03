@@ -9,6 +9,7 @@ import { PdfUploadField, type PdfMeta } from "@/components/PdfUploadField";
 import { PurchaseStatementQuickUpload } from "@/components/PurchaseStatementQuickUpload";
 import { saveUploadedPdf } from "@/lib/fileStorageActions";
 import type { ExtractedSaleInvoice, ExtractedPurchaseInvoice } from "@/lib/invoiceExtract";
+import { PartySearchSelect, type PartyOption } from "@/components/PartySearchSelect";
 
 type Direction = "sales" | "purchase";
 type SaleOption = { id: string; blNo: string; dateStr: string; partyName: string };
@@ -33,7 +34,7 @@ export function VoucherQuickEntry({
   parties,
   saleOptions,
 }: {
-  parties: { id: string; name: string }[];
+  parties: PartyOption[];
   saleOptions: SaleOption[];
 }) {
   const [open, setOpen] = useState(false);
@@ -41,7 +42,10 @@ export function VoucherQuickEntry({
   const [partyList, setPartyList] = useState(parties);
   const [blNo, setBlNo] = useState("");
   const [date, setDate] = useState("");
-  const [partyId, setPartyId] = useState(parties[0]?.id ?? "");
+  // 관세전표(CustomsQuickEntry)와 같은 검색형 선택(PartySearchSelect)으로 바꾸면서(2026-09-03)
+  // "첫 거래처가 기본 선택됨"이 사라졌다 — 거래처가 수십~수백 건이면 첫 거래처가 무엇인지도
+  // 모르고 그대로 등록되는 사고가 더 위험하다고 판단해, 직접 검색해서 고르게 한다.
+  const [partyId, setPartyId] = useState<string | null>(null);
   const [amountDisplay, setAmountDisplay] = useState("");
   const [currency, setCurrency] = useState<string>("KRW");
   const [fxAmountDisplay, setFxAmountDisplay] = useState("");
@@ -104,7 +108,11 @@ export function VoucherQuickEntry({
       } else {
         const result = await ensurePartyByName(partyName);
         if (result.ok) {
-          setPartyList((prev) => (prev.some((p) => p.id === result.party.id) ? prev : [...prev, result.party]));
+          // ensurePartyByName은 code를 안 돌려준다(이 경로로 새로 생기는 거래처는 아직 코드가
+          // 없다 — PartySearchSelect 표시용으로 null을 채워둔다).
+          setPartyList((prev) =>
+            prev.some((p) => p.id === result.party.id) ? prev : [...prev, { ...result.party, code: null }]
+          );
           setPartyId(result.party.id);
           setPartyHint(
             result.created ? `거래처 "${result.party.name}"를 자동 등록했습니다.` : `기존 거래처 "${result.party.name}"를 사용합니다.`
@@ -127,7 +135,7 @@ export function VoucherQuickEntry({
     e.preventDefault();
     setError(null);
 
-    if (!date || !blNo.trim()) {
+    if (!date || !blNo.trim() || !partyId) {
       setError("필수 항목을 모두 입력하세요.");
       return;
     }
@@ -135,13 +143,14 @@ export function VoucherQuickEntry({
       setError(isForeign ? "외화 금액과 적용 환율을 입력하세요." : "필수 항목을 모두 입력하세요.");
       return;
     }
+    const resolvedPartyId = partyId;
 
     startTransition(async () => {
       if (direction === "sales") {
         const result = await createSale({
           blNo,
           date,
-          partyId,
+          partyId: resolvedPartyId,
           amount: krwPreview,
           note,
           currency,
@@ -153,7 +162,7 @@ export function VoucherQuickEntry({
       } else {
         const result = await createPurchase({
           date,
-          partyId,
+          partyId: resolvedPartyId,
           amount: krwPreview,
           note,
           allocations: [{ blNo, amount: krwPreview }],
@@ -210,17 +219,13 @@ export function VoucherQuickEntry({
                 </div>
                 <div className="flex items-center justify-between gap-3">
                   <span className="text-sm text-muted">거래처</span>
-                  <select
+                  <PartySearchSelect
+                    parties={partyList}
                     value={partyId}
-                    onChange={(e) => setPartyId(e.target.value)}
-                    className="w-56 rounded-xl border border-border bg-surface px-3 py-2 text-base text-fg outline-none focus:border-accent focus:ring-2 focus:ring-accent-soft"
-                  >
-                    {partyList.map((p) => (
-                      <option key={p.id} value={p.id}>
-                        {p.name}
-                      </option>
-                    ))}
-                  </select>
+                    onChange={setPartyId}
+                    placeholder="코드/거래처명"
+                    className="w-56"
+                  />
                 </div>
                 <div className="flex items-start justify-between gap-3">
                   <span className="pt-2 text-sm text-muted">B/L</span>
