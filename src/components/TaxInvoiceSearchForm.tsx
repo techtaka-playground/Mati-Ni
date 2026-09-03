@@ -3038,12 +3038,35 @@ export function TaxInvoiceSearchForm({
                       <IconCheckCircle className="h-4 w-4 shrink-0" />
                       인식된 내용
                     </div>
-                    {confirmExtractInfo.lines.map((l, i) => (
-                      <div key={i} className="flex justify-between">
-                        <span className="text-fg">B/L {l.blNo}</span>
-                        <span className="num text-fg">{formatAmount(l.amount)}원</span>
-                      </div>
-                    ))}
+                    {confirmExtractInfo.lines.map((l, i) =>
+                      // 1건이면 이미 아래 B/L 칸에 자동으로 채워져 있으니 다시 누를 필요가 없다.
+                      // 여러 건이면(!single) 그동안 "직접 입력하세요"라고만 안내하고 아무것도
+                      // 채워주지 않았다 — 방금 눈으로 본 번호를 다시 손으로 쳐야 했다(2026-09-03
+                      // 피드백). 이제 줄을 클릭하면 그 B/L로 바로 채우고 팝업을 닫는다.
+                      single ? (
+                        <div key={i} className="flex justify-between">
+                          <span className="text-fg">B/L {l.blNo}</span>
+                          <span className="num text-fg">{formatAmount(l.amount)}원</span>
+                        </div>
+                      ) : (
+                        <button
+                          key={i}
+                          type="button"
+                          onClick={() => {
+                            if (confirmModal?.blRows) {
+                              updateConfirmBlRow(0, { blNo: l.blNo, amountDisplay: commaInput(String(Math.round(l.amount))) });
+                            } else {
+                              handleConfirmBlNoChange(l.blNo);
+                            }
+                            setConfirmExtractPopupOpen(false);
+                          }}
+                          className="flex justify-between rounded-lg px-1.5 py-0.5 text-left hover:bg-accent-soft"
+                        >
+                          <span className="text-fg">B/L {l.blNo}</span>
+                          <span className="num text-fg">{formatAmount(l.amount)}원</span>
+                        </button>
+                      )
+                    )}
                   </div>
                   {single && mismatch && (
                     <>
@@ -3072,8 +3095,8 @@ export function TaxInvoiceSearchForm({
                   )}
                   {!single && (
                     <p className="text-sm text-muted">
-                      이 인보이스는 여러 B/L을 커버하는 것으로 보입니다. 맞는 B/L을 아래에 직접
-                      입력하세요(여러 건으로 나눠 등록하려면 취소 후{" "}
+                      이 인보이스는 여러 B/L을 커버하는 것으로 보입니다. 맞는 B/L을 위에서 클릭해
+                      채우거나 아래에 직접 입력하세요(여러 건으로 나눠 등록하려면 취소 후{" "}
                       {confirmModal.dir === "purchase" ? '"묶어서 등록" 또는 "여러 B/L로 나눠 배분"' : '"묶어서 등록"'}
                       을 이용하세요). 금액은 세금계산서상 공급가액을 그대로 씁니다.
                       {/* 명세서에서 부가세를 빼서 읽었다는 사실을 알려준다 — 화면 금액이 문서에
