@@ -9,7 +9,9 @@ import type { ExtractedPurchaseStatementSmart } from "@/app/(app)/purchases/acti
 
 type SaleOption = { id: string; blNo: string; dateStr: string; partyName: string };
 
-type PreviewLine = { refNo: string; amount: number; matched: boolean };
+// matchedBlNo: 실제로 매출과 일치한 번호(House 또는 Master) — 매칭이 Master No로 이뤄졌으면
+// 배분도 그 번호로 저장해야 매출과 연결된다(매출.blNo와 정확히 같아야 함).
+type PreviewLine = { refNo: string; masterNo: string | null; amount: number; matched: boolean; matchedBlNo: string | null };
 type Preview = {
   data: ExtractedPurchaseStatementSmart;
   lines: PreviewLine[];
@@ -55,11 +57,12 @@ export function PurchaseStatementQuickUpload({
       }
       const data = result.data;
       const saleByBlNo = new Map(saleOptions.map((s) => [s.blNo, s]));
-      const lines: PreviewLine[] = data.lines.map((l) => ({
-        refNo: l.refNo,
-        amount: l.amount,
-        matched: saleByBlNo.has(l.refNo),
-      }));
+      const lines: PreviewLine[] = data.lines.map((l) => {
+        // House No(refNo)로 먼저 찾고, 없으면 Master No로도 시도한다 — 매출을 Master No로
+        // 등록해둔 경우가 있어서다.
+        const matchedBlNo = saleByBlNo.has(l.refNo) ? l.refNo : l.masterNo && saleByBlNo.has(l.masterNo) ? l.masterNo : null;
+        return { refNo: l.refNo, masterNo: l.masterNo, amount: l.amount, matched: matchedBlNo !== null, matchedBlNo };
+      });
       const matchedTotal = lines.filter((l) => l.matched).reduce((sum, l) => sum + l.amount, 0);
 
       let partyId = partyList[0]?.id ?? "";
@@ -104,7 +107,7 @@ export function PurchaseStatementQuickUpload({
         partyId: preview.partyId,
         amount: preview.matchedTotal,
         note,
-        allocations: matchedLines.map((l) => ({ blNo: l.refNo, amount: l.amount })),
+        allocations: matchedLines.map((l) => ({ blNo: l.matchedBlNo!, amount: l.amount })),
       });
       if (!result.ok) {
         setError(result.message);
@@ -151,10 +154,19 @@ export function PurchaseStatementQuickUpload({
                 <tbody>
                   {preview.lines.map((l, i) => (
                     <tr key={i} className="border-t border-border/60">
-                      <td className="py-1 pr-3 text-fg">{l.refNo}</td>
+                      <td className="py-1 pr-3 text-fg">
+                        {l.refNo}
+                        {l.masterNo && <div className="text-[11px] text-muted">M/N {l.masterNo}</div>}
+                      </td>
                       <td className="py-1 pr-3 text-right num text-fg">{formatAmount(l.amount)}</td>
                       <td className="py-1 pr-3">
-                        {l.matched ? <span className="text-muted">매출 있음</span> : <span className="text-neg">미매칭(제외)</span>}
+                        {l.matched ? (
+                          <span className="text-muted">
+                            매출 있음{l.matchedBlNo === l.masterNo && "(Master No)"}
+                          </span>
+                        ) : (
+                          <span className="text-neg">미매칭(제외)</span>
+                        )}
                       </td>
                     </tr>
                   ))}

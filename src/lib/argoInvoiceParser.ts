@@ -73,7 +73,13 @@ export async function parseArgoInvoice(buffer: Buffer): Promise<ParsedStatement>
 
   if (!refNo || amount == null) return { partyName, groupNo: null, period, lines: [] };
 
+  // masterNo는 refNo로 못 고른(즉 House와 별개인) 값일 때만 보조 식별자로 남긴다 — House가
+  // 없어서 refNo 자체가 Master가 된 경우엔 중복이라 null.
+  const altMasterNo = masterNo && masterNo !== refNo && BL_LIKE_RE.test(masterNo) ? masterNo : null;
+
   // 이 단건 INVOICE 양식에는 VAT 열이 따로 없다 — 읽은 Total을 그대로 공급가액으로 둔다.
-  const lines: ParsedStatementLine[] = [{ refNo, amount, vat: 0, supplyAmount: amount }];
+  const lines: ParsedStatementLine[] = [
+    { refNo, masterNo: altMasterNo, amount, vat: 0, supplyAmount: amount },
+  ];
   return { partyName, groupNo: null, period, lines };
 }

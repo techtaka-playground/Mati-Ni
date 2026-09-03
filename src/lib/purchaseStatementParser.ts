@@ -2,6 +2,9 @@ import { PDFParse } from "pdf-parse";
 
 export type ParsedStatementLine = {
   refNo: string;
+  // House No와 별개로 Master No가 인쇄돼 있으면 그 값. 없으면 null. 매출(B/L) 매칭 시
+  // refNo(House)로 못 찾으면 이 값으로도 시도한다 — 매출을 Master No로 등록한 경우가 있다.
+  masterNo: string | null;
   // 명세서에 인쇄된 그 B/L의 합계(원화, **부가세 포함**).
   amount: number;
   // 그 B/L에 붙은 부가세. 명세서의 "W/F / VAT" 열 중 원화 줄에 실린 값이다.
@@ -31,8 +34,13 @@ function parseAmount(raw: string): number {
 // 구분 없이 "refNo"로 취급한다. 합계 금액은 그 2줄 위(①번 줄)의 첫 필드에 있다.
 //
 // **pdf-parse가 뽑는 필드 순서는 화면에 보이는 것의 역순**이다. 그래서 각 줄의 앞쪽 필드가
-// 화면의 오른쪽 끝 열이다. 원화 비용줄(②번, 필드 12개)은 이렇게 대응된다:
+// 화면의 오른쪽 끝 열이다. 원화 비용줄(②번)은 이렇게 대응된다:
 //   field[0] = 그 줄의 Total(부가세 포함), field[1] = **VAT**, field[2] = OTH, field[3] = D/F, ...
+//   ... field[10] = Weight, field[11] = POL/POD, (있으면) field[12] = **Master No**
+// Master No는 그 줄의 맨 앞(화면 왼쪽 끝) 열이라 역순 배열에서는 맨 뒤에 붙는다 — 그래서
+// Master No가 없는 줄은 필드가 12개, 있는 줄은 13개다. VAT(field[1])는 그 여부와 무관하게
+// 위치가 고정이니 필드 개수는 "12개 이상"으로만 확인하면 된다(예전엔 정확히 12개만 허용해서
+// Master No가 있는 줄은 VAT를 0으로 놓치는 버그가 있었다).
 //
 // VAT를 읽는 것이 중요하다: 명세서의 B/L별 합계는 **부가세를 포함한 금액**이라, 그대로 쓰면
 // 세금계산서 공급가액과 딱 그 부가세만큼 어긋난다(실측: 합계 6,137,492 vs 공급가액 6,129,097,
@@ -76,16 +84,18 @@ export async function parsePurchaseStatement(buffer: Buffer): Promise<ParsedStat
     const amount = parseAmount(lines[totalLineIdx].split("\t")[0] ?? "");
     if (amount <= 0) continue;
 
-    // 바로 위(②번) 원화 별원줄에서 VAT를 읽는다. 이 양식의 원화줄은 필드가 12개이고 두 번째가
-    // VAT다 — 필드 수가 다를면 다른 양식이거나 줄이 밀린 것이뭐로 VAT를 0으로 두고 넘어간다
-    // (틀린 값을 벌서 금액을 망치는 것보다 안전하다).
+    // 바로 위(②번) 원화 별원줄에서 VAT와(있으면) Master No를 읽는다. 이 양식의 원화줄은
+    // 필드가 최소 12개이고 두 번째가 VAT다 — Master No가 있으면 맨 뒤에 한 필드가 더 붙는다
+    // (위 주석 참고). 12개 미만이면 다른 양식이거나 줄이 밀린 것이므로 VAT를 0으로 두고
+    // 넘어간다(틀린 값을 넣어서 금액을 망치는 것보다 안전하다).
     const krwFields = (lines[i - 1] ?? "").split("\t");
-    const vat = krwFields.length === 12 ? parseAmount(krwFields[1] ?? "") : 0;
+    const vat = krwFields.length >= 12 ? parseAmount(krwFields[1] ?? "") : 0;
+    const masterNo = krwFields.length > 12 ? krwFields[krwFields.length - 1]?.trim() || null : null;
 
     const key = `${refNo}|${i}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    results.push({ refNo, amount, vat, supplyAmount: amount - vat });
+    results.push({ refNo, masterNo, amount, vat, supplyAmount: amount - vat });
   }
 
   return { partyName, groupNo, period, lines: results };

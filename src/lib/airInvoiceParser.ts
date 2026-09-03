@@ -98,10 +98,13 @@ export async function parseAirInvoice(buffer: Buffer): Promise<ParsedStatement> 
 
   const textLines = text.split("\n");
 
-  // 화물 식별자는 HAWB(House) 우선, 없으면 MAWB(Master).
-  const refNo =
-    findInlineLabelValue(textLines, "HAWB No") ?? findInlineLabelValue(textLines, "MAWB No");
+  // 화물 식별자는 HAWB(House) 우선, 없으면 MAWB(Master). 둘 다 있으면 MAWB는 매출(B/L) 매칭
+  // 시 refNo(HAWB)로 못 찾을 때 시도할 보조 식별자로 남긴다.
+  const houseNo = findInlineLabelValue(textLines, "HAWB No");
+  const mawbNo = findInlineLabelValue(textLines, "MAWB No");
+  const refNo = houseNo ?? mawbNo;
   if (!refNo) return empty;
+  const masterNo = mawbNo && mawbNo !== refNo ? mawbNo : null;
 
   const partyName = findCustomer(textLines);
 
@@ -111,7 +114,7 @@ export async function parseAirInvoice(buffer: Buffer): Promise<ParsedStatement> 
   const vat = total?.vat ?? 0;
 
   const lines: ParsedStatementLine[] = [
-    { refNo, amount, vat, supplyAmount: amount - vat },
+    { refNo, masterNo, amount, vat, supplyAmount: amount - vat },
   ];
   return { partyName, groupNo: null, period: null, lines };
 }

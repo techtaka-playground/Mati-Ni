@@ -28,6 +28,13 @@ const PurchaseStatementLineSchema = z.object({
     "이 줄(shipment)의 식별번호 — House No가 있으면 House No, House No가 비어있고 Master No만 있으면 " +
       "Master No를 사용"
   ),
+  masterNo: z
+    .string()
+    .nullable()
+    .describe(
+      "House No와 별개로 Master No가 함께 표시돼 있으면 그 값. refNo로 이미 Master No를 썼거나 " +
+        "Master No가 아예 없으면 null"
+    ),
   amount: z.number().describe("이 줄의 청구 합계(Total) 금액, 숫자만"),
 });
 const PurchaseStatementSchema = z.object({
@@ -104,8 +111,9 @@ export function extractPurchaseStatement(base64: string): Promise<ExtractedPurch
     PurchaseStatementSchema,
     "이 PDF는 포워더가 여러 건의 화물(선적)에 대해 청구하는 매입 명세서(지출결의서 등)입니다. " +
       "House No 컬럼과 Master No 컬럼이 있고, 화물 한 건마다 House No(우선) 또는 Master No(House " +
-      "No가 비어있을 때)와 그 줄의 청구 합계(Total) 금액이 있습니다. 문서에 나열된 개별 화물 줄을 " +
-      "모두 빠짐없이 추출하세요 — 소계·페이지합계·Grand Total 같은 합산 줄은 포함하지 마세요. " +
+      "No가 비어있을 때)와 그 줄의 청구 합계(Total) 금액이 있습니다. House No와 Master No가 둘 다 " +
+      "표시된 줄은 refNo에 House No를, masterNo에 Master No를 따로 채우세요. 문서에 나열된 개별 " +
+      "화물 줄을 모두 빠짐없이 추출하세요 — 소계·페이지합계·Grand Total 같은 합산 줄은 포함하지 마세요. " +
       "거래처명(Customer), Group No, Period(청구 대상 기간)도 있으면 함께 추출하세요.",
     4096
   );
