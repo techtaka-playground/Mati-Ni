@@ -28,7 +28,7 @@ export async function createParty(formData: FormData) {
   if (bizNo && (await prisma.party.findUnique({ where: { bizNo } }))) return; // 이미 있는 사업자번호
 
   await prisma.party.create({
-    data: { name, note, bizNo, code: bizNo ? await nextPartyCode() : null, source: "manual" },
+    data: { name, note, bizNo, code: await nextPartyCode(), source: "manual" },
   });
   revalidatePath("/parties");
 }
