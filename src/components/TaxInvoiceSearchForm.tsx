@@ -756,9 +756,11 @@ export function TaxInvoiceSearchForm({
     blNo: string,
     registerAs: RegisterAs,
     customsPartyId: string | null = null,
-    // 매출에서 B/L을 2건 이상으로 나눠 등록할 때만 넘긴다(confirmModal의 "+") — 안 넘기면
-    // 기존처럼 blNo 하나 + 전체 금액으로 등록한다.
-    salesAllocations?: { blNo: string; amount: number }[]
+    // B/L을 2건 이상으로 나눠 등록할 때만 넘긴다(confirmModal의 blRows — PDF 인식이 여러 B/L을
+    // 찾아 자동으로 채웠거나, 매출은 "+B/L 추가"로 직접 나눈 경우). 안 넘기면 기존처럼 blNo
+    // 하나 + 전체 금액으로 등록한다. registerFromTaxInvoice는 매출·매입 모두 allocations
+    // 배열을 받으므로 방향과 무관하게 그대로 쓸 수 있다.
+    multiAllocations?: { blNo: string; amount: number }[]
   ): Promise<{ ok: true } | { ok: false; message: string }> {
     const ntsSendKey = row.ntsSendKey;
     setRegisterErrors((prev) => {
@@ -773,7 +775,7 @@ export function TaxInvoiceSearchForm({
           ? {
               ntsSendKey,
               direction: "sales",
-              allocations: salesAllocations ?? [{ blNo, amount: row.amountTotal }],
+              allocations: multiAllocations ?? [{ blNo, amount: row.amountTotal }],
               counterpartName: row.counterpartCorpName,
               counterpartCorpNum: row.counterpartCorpNum,
               writeDate: row.writeDate,
@@ -784,7 +786,7 @@ export function TaxInvoiceSearchForm({
               direction: "purchase",
               registerAs,
               customsPartyId,
-              allocations: [{ blNo, amount: row.amountTotal }],
+              allocations: multiAllocations ?? [{ blNo, amount: row.amountTotal }],
               counterpartName: row.counterpartCorpName,
               counterpartCorpNum: row.counterpartCorpNum,
               writeDate: row.writeDate,
@@ -930,10 +932,11 @@ export function TaxInvoiceSearchForm({
     // 틀릴 수도 있어 완전히 막지는 않고 사용자가 알고 넘어가게만 한다.
     if (!confirmDespiteValidation(confirmModal.row)) return;
 
-    // B/L을 여러 줄로 나눴으면(매출만) 여기서 배분 금액 합계를 검증한다 — "여러 B/L로 나눠
+    // B/L을 여러 줄로 나눴으면(매출·매입 공통 — PDF 인식이 여러 B/L을 찾아 자동으로 나눴거나,
+    // 매출은 "+B/L 추가"로 직접 나눈 경우) 여기서 배분 금액 합계를 검증한다 — "여러 B/L로 나눠
     // 배분" 팝업(handleRegisterMulti)과 같은 기준: 합계가 공급가액과 정확히 같아야 한다.
-    let salesAllocations: { blNo: string; amount: number }[] | undefined;
-    if (confirmModal.dir === "sales" && confirmModal.blRows) {
+    let multiAllocations: { blNo: string; amount: number }[] | undefined;
+    if (confirmModal.blRows) {
       const allocations = confirmModal.blRows
         .filter((r) => r.blNo.trim())
         .map((r) => ({ blNo: r.blNo.trim(), amount: numOf(r.amountDisplay) }));
@@ -948,7 +951,7 @@ export function TaxInvoiceSearchForm({
         );
         return;
       }
-      salesAllocations = allocations;
+      multiAllocations = allocations;
     }
 
     setConfirmError(null);
@@ -960,7 +963,7 @@ export function TaxInvoiceSearchForm({
         confirmModal.blNo,
         confirmModal.registerAs,
         confirmModal.customsPartyId,
-        salesAllocations
+        multiAllocations
       );
       if (result.ok) {
         setConfirmModal(null);
@@ -1147,10 +1150,11 @@ export function TaxInvoiceSearchForm({
   }
 
   // 단건 등록 확인 팝업에도 실제 인보이스(지출결의서 등) PDF를 첨부해서 내용을 확인할 수 있게
-  // 한다 — 이 팝업은 B/L 1개·금액은 세금계산서 공급가액 고정(나눌 필요 없음)이므로, PDF에서
-  // 인식된 B/L을 그대로 입력칸에 채워 확인시켜주는 용도다. 문서에 B/L이 여러 건 있으면(이
-  // 인보이스가 여러 건을 커버하는 경우) 전부 나열해서 사용자가 맞는 것을 고르게 하고, 자동
-  // 배분은 하지 않는다(그건 "여러 B/L로 나눠 배분" 팝업의 역할).
+  // 한다. B/L이 1건이면 그대로 입력칸에 채우고, 여러 건이면(이 인보이스가 여러 건을 커버하는
+  // 경우) 인식된 줄 전부를 B/L별 배분 목록(blRows)으로 자동 채운다 — 예전엔 목록만 보여주고
+  // "직접 입력하세요"라고만 안내해서, 사람이 보이는 번호를 다시 손으로 치거나 하나씩 골라야
+  // 했다(2026-09-03 피드백: "2개면 B/L에 2개가 전부나와야지"). registerFromTaxInvoice는
+  // 매출·매입 모두 원래 여러 줄 배분(allocations)을 받으므로 방향과 무관하게 그대로 쓸 수 있다.
   async function handleConfirmFileChange(file: File | null) {
     setConfirmFile(file);
     setConfirmExtractInfo(null);
@@ -1175,12 +1179,12 @@ export function TaxInvoiceSearchForm({
 
       const lines = result.data.lines.map((l) => ({ blNo: l.refNo, amount: l.supplyAmount ?? l.amount, vat: l.vat ?? 0 }));
       if (lines.length === 1) {
-        // 매출은 이제 항상 줄(항목+B/L+금액) 목록이라 confirmModal.blNo가 아니라 첫 줄에
-        // 직접 채운다 — 안 그러면 인식 결과 팝업에서 "확인"을 눌러도 화면의 B/L 입력칸은
-        // 그대로 비어 있는 것처럼 보인다(2026-08-27, 실제로 그렇게 비어 있었다는 피드백).
-        // 금액도 공급가액이 아니라 인식된 금액으로 채운다 — 공급가액과 다르면(위 팝업의
-        // "차액") 배분 합계도 자연히 안 맞게 표시되어, 나머지 차액을 다른 줄에 채워 넣어야
-        // 한다는 게 눈에 바로 보인다.
+        // 줄(항목+B/L+금액) 목록 모드면 confirmModal.blNo가 아니라 첫 줄에 직접 채운다 —
+        // 안 그러면 인식 결과 팝업에서 "확인"을 눌러도 화면의 B/L 입력칸은 그대로 비어 있는
+        // 것처럼 보인다(2026-08-27, 실제로 그렇게 비어 있었다는 피드백). 금액도 공급가액이
+        // 아니라 인식된 금액으로 채운다 — 공급가액과 다르면(위 팝업의 "차액") 배분 합계도
+        // 자연히 안 맞게 표시되어, 나머지 차액을 다른 줄에 채워 넣어야 한다는 게 눈에 바로
+        // 보인다.
         if (confirmModal?.blRows) {
           updateConfirmBlRow(0, {
             blNo: lines[0].blNo,
@@ -1189,6 +1193,21 @@ export function TaxInvoiceSearchForm({
         } else {
           handleConfirmBlNoChange(lines[0].blNo);
         }
+      } else {
+        // 여러 줄이면 전부를 배분 목록으로 바로 채운다 — 방향(매출/매입) 상관없이 같은
+        // blRows 메커니즘을 쓴다.
+        setConfirmModal((prev) =>
+          prev
+            ? {
+                ...prev,
+                blRows: lines.map((l) => ({
+                  blNo: l.blNo,
+                  amountDisplay: commaInput(String(Math.round(l.amount))),
+                  kind: "bl" as const,
+                })),
+              }
+            : prev
+        );
       }
       setConfirmExtractInfo({ method: result.data.method, lines });
       setConfirmExtractPopupOpen(true);
@@ -3032,48 +3051,19 @@ export function TaxInvoiceSearchForm({
                 <>
                   {/* "인식된 내용" 박스 — B/L이 1건이든 여러 건이든 같은 모양으로 보여준다
                       (2026-08-27: 1건일 때만 문장으로 두면 여러 건일 때랑 생김새가 달라져서
-                      통일). 각 줄이 곧 인식된 B/L 하나다. */}
+                      통일). 여러 건이면 이 목록에 있는 값이 그대로 아래 배분 목록에 자동으로
+                      채워져 있다 — 이 박스는 그 내용을 다시 확인하는 용도라 읽기 전용이다. */}
                   <div className="flex flex-col gap-1.5 rounded-xl border border-border bg-gray-95 px-4 py-3 text-sm">
                     <div className="flex items-center gap-1.5 font-medium text-pos">
                       <IconCheckCircle className="h-4 w-4 shrink-0" />
                       인식된 내용
                     </div>
-                    {confirmExtractInfo.lines.map((l, i) =>
-                      // 1건이면 이미 아래 B/L 칸에 자동으로 채워져 있으니 다시 누를 필요가 없다.
-                      // 여러 건이면(!single) 그동안 "직접 입력하세요"라고만 안내하고 아무것도
-                      // 채워주지 않았다 — 방금 눈으로 본 번호를 다시 손으로 쳐야 했다(2026-09-03
-                      // 피드백). 이제 줄을 클릭하면 그 B/L로 바로 채우고 팝업을 닫는다.
-                      single ? (
-                        <div key={i} className="flex justify-between">
-                          <span className="text-fg">B/L {l.blNo}</span>
-                          <span className="num text-fg">{formatAmount(l.amount)}원</span>
-                        </div>
-                      ) : (
-                        // 그냥 hover 배경만 주면 "확인" 버튼처럼 눌러야 하는 버튼처럼 안 보여서
-                        // 그동안 하던 대로 아래 "확인"만 누르고 넘어가는 사람이 있었다(2026-09-03
-                        // 재피드백 — "안나오는데?"). 테두리+배경+"선택" 글자로 확실한 버튼
-                        // 모양을 준다.
-                        <button
-                          key={i}
-                          type="button"
-                          onClick={() => {
-                            if (confirmModal?.blRows) {
-                              updateConfirmBlRow(0, { blNo: l.blNo, amountDisplay: commaInput(String(Math.round(l.amount))) });
-                            } else {
-                              handleConfirmBlNoChange(l.blNo);
-                            }
-                            setConfirmExtractPopupOpen(false);
-                          }}
-                          className="flex items-center justify-between rounded-lg border border-accent/40 bg-surface px-3 py-2 text-left hover:border-accent hover:bg-accent-soft"
-                        >
-                          <span className="text-fg">B/L {l.blNo}</span>
-                          <span className="flex items-center gap-2">
-                            <span className="num text-fg">{formatAmount(l.amount)}원</span>
-                            <span className="rounded-full bg-accent px-2 py-0.5 text-xs font-medium text-accent-fg">선택</span>
-                          </span>
-                        </button>
-                      )
-                    )}
+                    {confirmExtractInfo.lines.map((l, i) => (
+                      <div key={i} className="flex justify-between">
+                        <span className="text-fg">B/L {l.blNo}</span>
+                        <span className="num text-fg">{formatAmount(l.amount)}원</span>
+                      </div>
+                    ))}
                   </div>
                   {single && mismatch && (
                     <>
@@ -3102,10 +3092,11 @@ export function TaxInvoiceSearchForm({
                   )}
                   {!single && (
                     <p className="text-sm text-muted">
-                      이 인보이스는 여러 B/L을 커버하는 것으로 보입니다. 맞는 B/L을 위에서 클릭해
-                      채우거나 아래에 직접 입력하세요(여러 건으로 나눠 등록하려면 취소 후{" "}
+                      이 인보이스는 여러 B/L을 커버하는 것으로 보여, 인식된 {confirmExtractInfo.lines.length}건을
+                      아래 B/L 목록에 전부 자동으로 나눠 채웠습니다. 확인하고 필요하면 직접
+                      수정하세요(세금계산서 여러 건을 하나로 묶으려면 취소 후{" "}
                       {confirmModal.dir === "purchase" ? '"묶어서 등록" 또는 "여러 B/L로 나눠 배분"' : '"묶어서 등록"'}
-                      을 이용하세요). 금액은 세금계산서상 공급가액을 그대로 씁니다.
+                      을 이용하세요).
                       {/* 명세서에서 부가세를 빼서 읽었다는 사실을 알려준다 — 화면 금액이 문서에
                           인쇄된 B/L 합계와 다른 이유가 여기 있다. */}
                       {confirmExtractInfo.lines.some((l) => l.vat > 0) &&
