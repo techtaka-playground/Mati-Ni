@@ -224,9 +224,9 @@ export async function deleteCustomsAllocation(allocationId: string): Promise<Cus
 
 // 외화(달러/엔화 등)로 입력한 관세대납의 남은 미배분 잔액을 은행거래 없이 환차손익으로
 // 정리한다 — VoucherTable의 같은 기능과 같은 이유(bankAllocation.ts createFxAdjustment 참고).
-export async function createCustomsFxAdjustment(id: string, note: string): Promise<CustomsVoucherActionResult> {
+export async function createCustomsFxAdjustment(id: string): Promise<CustomsVoucherActionResult> {
   const user = await requireCustomsAccess();
-  const result = await createFxAdjustmentLib("customsAdvance", id, note, user.email);
+  const result = await createFxAdjustmentLib("customsAdvance", id, user.email);
   if (result.ok) revalidateAll();
   return result;
 }
@@ -301,9 +301,9 @@ export async function deleteCustomsRecoveryAllocation(allocationId: string): Pro
   return result;
 }
 
-export async function createCustomsRecoveryFxAdjustment(id: string, note: string): Promise<CustomsVoucherActionResult> {
+export async function createCustomsRecoveryFxAdjustment(id: string): Promise<CustomsVoucherActionResult> {
   const user = await requireCustomsAccess();
-  const result = await createFxAdjustmentLib("customsAdvanceRecovery", id, note, user.email);
+  const result = await createFxAdjustmentLib("customsAdvanceRecovery", id, user.email);
   if (result.ok) revalidateAll();
   return result;
 }

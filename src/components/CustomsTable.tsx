@@ -187,7 +187,6 @@ export function CustomsTable({
   // 환차손익으로 정리 — 일반전표(VoucherTable)와 같은 기능(2026-09-03) — "배분" 액션 안에
   // 합쳐져 있다(VoucherTable의 fxWriteOff 주석 참고).
   const [fxWriteOff, setFxWriteOff] = useState(false);
-  const [fxNote, setFxNote] = useState("");
 
   const onSort = (k: CustomsSortKey) => setSort((p) => toggleSort(p, k));
 
@@ -261,7 +260,6 @@ export function CustomsTable({
     setMatchError(null);
     setMatchSearch("");
     setFxWriteOff(false);
-    setFxNote("");
     loadMatchCandidates(kind, partyId, "");
   }
 
@@ -271,7 +269,6 @@ export function CustomsTable({
     const remaining = matchModal.amount - matchModal.allocatedTotal;
     setMatchAmountDisplay(commaInput(String(Math.round(Math.min(remaining, c.remaining)))));
     setFxWriteOff(false);
-    setFxNote("");
   }
 
   // 배분 저장 — "차액을 환차손익으로 함께 처리" 체크박스를 켰으면 배분 직후 남은 잔액도
@@ -281,10 +278,6 @@ export function CustomsTable({
     const amount = numOf(matchAmountDisplay);
     if (!(amount > 0)) {
       setMatchError("배분 금액을 입력하세요.");
-      return;
-    }
-    if (fxWriteOff && !fxNote.trim()) {
-      setMatchError("환차손익 처리 사유를 입력하세요.");
       return;
     }
     startMatchSaveTransition(async () => {
@@ -297,8 +290,8 @@ export function CustomsTable({
       }
       if (fxWriteOff) {
         const fxResult = await (matchModal.kind === "customsAdvance"
-          ? createCustomsFxAdjustment(matchModal.id, fxNote)
-          : createCustomsRecoveryFxAdjustment(matchModal.id, fxNote));
+          ? createCustomsFxAdjustment(matchModal.id)
+          : createCustomsRecoveryFxAdjustment(matchModal.id));
         if (!fxResult.ok) {
           setMatchError(fxResult.message);
           return;
@@ -875,28 +868,17 @@ export function CustomsTable({
                       (2026-09-03, VoucherTable과 같은 방식). */}
                   {matchModal.currency !== "KRW" &&
                     matchModal.amount - matchModal.allocatedTotal - numOf(matchAmountDisplay) > 0.5 && (
-                      <div className="flex flex-col gap-1.5 rounded-lg border border-accent/30 bg-accent-soft/40 p-2.5">
-                        <label className="flex items-center gap-2 text-sm text-fg">
-                          <input
-                            type="checkbox"
-                            checked={fxWriteOff}
-                            onChange={(e) => setFxWriteOff(e.target.checked)}
-                            className="h-4 w-4 accent-accent"
-                          />
-                          차액{" "}
-                          {formatAmount(matchModal.amount - matchModal.allocatedTotal - numOf(matchAmountDisplay))}원을
-                          환차손익으로 함께 처리
-                        </label>
-                        {fxWriteOff && (
-                          <textarea
-                            value={fxNote}
-                            onChange={(e) => setFxNote(e.target.value)}
-                            placeholder="사유(필수) — 예: 결제일 환율 하락으로 8,000원 부족"
-                            rows={2}
-                            className="rounded-md border border-border bg-surface px-2.5 py-1.5 text-sm text-fg outline-none focus:border-accent"
-                          />
-                        )}
-                      </div>
+                      <label className="flex items-center gap-2 rounded-lg border border-accent/30 bg-accent-soft/40 p-2.5 text-sm text-fg">
+                        <input
+                          type="checkbox"
+                          checked={fxWriteOff}
+                          onChange={(e) => setFxWriteOff(e.target.checked)}
+                          className="h-4 w-4 accent-accent"
+                        />
+                        차액{" "}
+                        {formatAmount(matchModal.amount - matchModal.allocatedTotal - numOf(matchAmountDisplay))}원을
+                        환차손익으로 함께 처리
+                      </label>
                     )}
                 </div>
               )}

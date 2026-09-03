@@ -123,9 +123,9 @@ export async function deleteAllocation(allocationId: string): Promise<VoucherAct
 
 // 외화 전표의 남은 미배분 잔액(입력 시점 환율 vs 실제 결제 환율 차이)을 은행거래 없이
 // 환차손익으로 정리한다 — KRW 전표에는 쓸 수 없다(createFxAdjustmentLib이 막는다).
-export async function createFxAdjustment(kind: VoucherKind, id: string, note: string): Promise<VoucherActionResult> {
+export async function createFxAdjustment(kind: VoucherKind, id: string): Promise<VoucherActionResult> {
   const user = await requireVouchersAccess();
-  const result = await createFxAdjustmentLib(kind, id, note, user.email);
+  const result = await createFxAdjustmentLib(kind, id, user.email);
   if (result.ok) revalidateAll();
   return result;
 }

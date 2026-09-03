@@ -206,9 +206,8 @@ export function VoucherTable({
   // (그 차이가 입력 시점 환율과 실제 결제 환율의 차이라서), 체크박스를 켜면 "배분"을 누르는
   // 순간 그 차액도 같이 환차손익으로 정리한다(2026-09-03) — 처음엔 은행거래 없이 잔액 전체를
   // 통째로 정리하는 별도 버튼이었는데, 실제 배분과 분리돼 있어 헷갈린다는 피드백에 따라
-  // "배분" 액션 안으로 합쳤다.
+  // "배분" 액션 안으로 합쳤다. 사유 입력칸은 번거롭다는 피드백에 따라 없앴다.
   const [fxWriteOff, setFxWriteOff] = useState(false);
-  const [fxNote, setFxNote] = useState("");
 
   // 한 전표가 B/L별로 여러 줄로 펼쳐지므로 **줄 단위가 아니라 전표 단위로** 정렬한다 —
   // 줄 단위로 정렬하면 같은 전표의 줄들이 흩어져 왼쪽 연결선이 무의미해진다. 정렬 값은 그 전표의
@@ -386,7 +385,6 @@ export function VoucherTable({
     setMatchError(null);
     setMatchSearch("");
     setFxWriteOff(false);
-    setFxNote("");
     loadMatchCandidates(kind, r.partyId, "");
   }
 
@@ -396,7 +394,6 @@ export function VoucherTable({
     const remainingVoucher = matchModal.amount - matchModal.allocatedTotal;
     setMatchAmountDisplay(commaInput(String(Math.round(Math.min(remainingVoucher, c.remaining)))));
     setFxWriteOff(false);
-    setFxNote("");
   }
 
   // 배분 저장 — 외화 전표에서 "차액을 환차손익으로 함께 처리" 체크박스를 켰으면, 실제
@@ -409,10 +406,6 @@ export function VoucherTable({
       setMatchError("배분 금액을 입력하세요.");
       return;
     }
-    if (fxWriteOff && !fxNote.trim()) {
-      setMatchError("환차손익 처리 사유를 입력하세요.");
-      return;
-    }
     startMatchSaveTransition(async () => {
       const result = await createManualAllocation(matchModal.kind, matchModal.settleId, selectedCandidate.transRefKey, amount);
       if (!result.ok) {
@@ -420,7 +413,7 @@ export function VoucherTable({
         return;
       }
       if (fxWriteOff) {
-        const fxResult = await createFxAdjustment(matchModal.kind, matchModal.settleId, fxNote);
+        const fxResult = await createFxAdjustment(matchModal.kind, matchModal.settleId);
         if (!fxResult.ok) {
           setMatchError(fxResult.message);
           return;
@@ -1221,28 +1214,17 @@ export function VoucherTable({
                       금액은 서버가 다시 계산하므로(createFxAdjustment) 여기 표시는 미리보기다. */}
                   {matchModal.currency !== "KRW" &&
                     matchModal.amount - matchModal.allocatedTotal - numOf(matchAmountDisplay) > 0.5 && (
-                      <div className="flex flex-col gap-1.5 rounded-lg border border-accent/30 bg-accent-soft/40 p-2.5">
-                        <label className="flex items-center gap-2 text-sm text-fg">
-                          <input
-                            type="checkbox"
-                            checked={fxWriteOff}
-                            onChange={(e) => setFxWriteOff(e.target.checked)}
-                            className="h-4 w-4 accent-accent"
-                          />
-                          차액{" "}
-                          {formatAmount(matchModal.amount - matchModal.allocatedTotal - numOf(matchAmountDisplay))}원을
-                          환차손익으로 함께 처리
-                        </label>
-                        {fxWriteOff && (
-                          <textarea
-                            value={fxNote}
-                            onChange={(e) => setFxNote(e.target.value)}
-                            placeholder="사유(필수) — 예: 결제일 환율 하락으로 8,000원 부족"
-                            rows={2}
-                            className="rounded-md border border-border bg-surface px-2.5 py-1.5 text-sm text-fg outline-none focus:border-accent"
-                          />
-                        )}
-                      </div>
+                      <label className="flex items-center gap-2 rounded-lg border border-accent/30 bg-accent-soft/40 p-2.5 text-sm text-fg">
+                        <input
+                          type="checkbox"
+                          checked={fxWriteOff}
+                          onChange={(e) => setFxWriteOff(e.target.checked)}
+                          className="h-4 w-4 accent-accent"
+                        />
+                        차액{" "}
+                        {formatAmount(matchModal.amount - matchModal.allocatedTotal - numOf(matchAmountDisplay))}원을
+                        환차손익으로 함께 처리
+                      </label>
                     )}
                 </div>
               )}

@@ -391,16 +391,13 @@ export function sumFxAdjusted(details: FxAdjustmentDetail[] | undefined): number
 // 남은 미배분 잔액 **전액**을 환차손익으로 정리한다(부분 정리는 지원하지 않는다 — 얼마가
 // 남았는지는 서버가 다시 계산해서 쓰지, 클라이언트가 보낸 금액을 믿지 않는다). 외화 전표에만
 // 쓸 수 있다 — KRW 전표는 은행 매칭이 안 되는 이유가 환율 차이일 수 없으므로 이 창구를 쓸
-// 이유가 없다.
+// 이유가 없다. 사유 입력은 실제 배분 액션(매칭 팝업)에 곧바로 딸린 체크박스라 굳이 따로
+// 받지 않는다(2026-09-03, 처음엔 필수 입력칸이 있었는데 번거롭다는 피드백에 따라 없앰).
 export async function createFxAdjustment(
   kind: AllocationKind,
   targetId: string,
-  note: string,
   createdByEmail: string
 ): Promise<AllocationActionResult> {
-  const trimmedNote = note.trim();
-  if (!trimmedNote) return { ok: false, message: "환차손익 처리 사유를 입력하세요." };
-
   const target = await getTargetState(kind, targetId);
   if (!target) return { ok: false, message: "대상을 찾을 수 없습니다." };
   if (target.confirmedAt) return { ok: false, message: "이미 확정된 건입니다. 먼저 확정을 해제하세요." };
@@ -414,7 +411,7 @@ export async function createFxAdjustment(
   if (remaining <= EPS) return { ok: false, message: "이미 전액 배분되어 정리할 차액이 없습니다." };
 
   await prisma.fxAdjustment.create({
-    data: { kind, targetId, amount: remaining, note: trimmedNote, createdByEmail },
+    data: { kind, targetId, amount: remaining, note: "", createdByEmail },
   });
   return { ok: true };
 }
