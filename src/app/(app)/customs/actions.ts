@@ -44,7 +44,12 @@ function revalidateAll() {
 export type CustomsAdvanceInput = {
   blNo: string;
   paidDate: string;
+  // KRW면 이 값을 그대로 쓰고, 외화면 fxAmount*fxRate를 서버에서 다시 계산해 덮어쓴다(화면
+  // 값을 신뢰하지 않는다 — 금액 계산은 항상 서버가 최종 확정).
   amount: number;
+  currency: string; // "KRW" | "USD" | "JPY" | ... — 항상 필수, 기본값은 화면에서 "KRW"
+  fxAmount?: number | null; // currency가 KRW가 아니면 필수(외화 금액)
+  fxRate?: number | null; // currency가 KRW가 아니면 필수(적용 환율, 외화 1단위당 원화)
   note: string;
   partyId?: string | null; // 선택 — 거래처 마스터에 이미 있는 거래처만 지정할 수 있다
   payeePartyId?: string | null; // 선택 — 실제로 돈을 지급받는 대상(관세사·포워더 등, partyId와 다를 수 있다)
@@ -71,8 +76,26 @@ export async function resolveCustomsPartyId(
 export async function createCustomsAdvance(input: CustomsAdvanceInput): Promise<CustomsAdvanceActionResult> {
   await requireCustomsAccess();
   const blNo = input.blNo.trim();
-  if (!blNo || !input.paidDate || !Number.isFinite(input.amount)) {
+  const currency = (input.currency || "KRW").trim().toUpperCase();
+  if (!blNo || !input.paidDate) {
     return { ok: false, message: "필수 항목을 모두 입력하세요." };
+  }
+
+  // 원화 환산액은 항상 서버에서 계산한다 — 외화×환율은 클라이언트가 미리 곱해서 보내도
+  // 반올림 방식이 다르면 어긋날 수 있어, 화면 값을 그대로 믿지 않고 여기서 다시 확정한다.
+  let amount: number;
+  let fxAmount: number | null = null;
+  let fxRate: number | null = null;
+  if (currency === "KRW") {
+    if (!Number.isFinite(input.amount)) return { ok: false, message: "필수 항목을 모두 입력하세요." };
+    amount = input.amount;
+  } else {
+    if (!Number.isFinite(input.fxAmount) || !Number.isFinite(input.fxRate)) {
+      return { ok: false, message: "외화 금액과 적용 환율을 입력하세요." };
+    }
+    fxAmount = input.fxAmount!;
+    fxRate = input.fxRate!;
+    amount = Math.round(fxAmount * fxRate);
   }
 
   const party = await resolveCustomsPartyId(input.partyId);
@@ -89,7 +112,10 @@ export async function createCustomsAdvance(input: CustomsAdvanceInput): Promise<
       partyId: party.partyId,
       payeePartyId: payeeParty.partyId,
       paidDate: parseDateInput(input.paidDate),
-      amount: input.amount,
+      amount,
+      currency,
+      fxAmount,
+      fxRate,
       note: input.note,
     },
   });
@@ -184,6 +210,67 @@ export async function createCustomsAllocation(
 }
 
 export async function deleteCustomsAllocation(allocationId: string): Promise<CustomsVoucherActionResult> {
+  await requireCustomsAccess();
+  const result = await deleteAllocationLib(allocationId);
+  if (result.ok) revalidateAll();
+  return result;
+}
+
+// ── 입금(회수) 매칭·확정 — 출금과 완전히 독립된 별도 흐름이다(2026-09-03 추가). 같은
+// CustomsAdvance 행이지만 kind는 "customsAdvanceRecovery", 확정 필드는 depositConfirmedAt이라
+// 출금 쪽 확정 여부와 무관하게 따로 배분·확정할 수 있다.
+export async function confirmCustomsRecovery(id: string): Promise<CustomsVoucherActionResult> {
+  const user = await requireCustomsAccess();
+  const advance = await prisma.customsAdvance.findUnique({ where: { id }, select: { amount: true } });
+  if (!advance) return { ok: false, message: "대상을 찾을 수 없습니다." };
+
+  const allocated = sumAllocated((await getAllocationsByTargets("customsAdvanceRecovery", [id])).get(id));
+  if (!isFullyAllocated(advance.amount, allocated)) {
+    return { ok: false, message: "입금 배분이 100% 완료되지 않아 확정할 수 없습니다." };
+  }
+
+  await prisma.customsAdvance.update({
+    where: { id },
+    data: { depositConfirmedAt: new Date(), depositConfirmedByEmail: user.email },
+  });
+  revalidateAll();
+  return { ok: true };
+}
+
+export async function unconfirmCustomsRecovery(id: string, reason: string): Promise<CustomsVoucherActionResult> {
+  const user = await requireCustomsAccess();
+  if (user.role !== "admin") return { ok: false, message: "관리자만 확정을 해제할 수 있습니다." };
+  const trimmed = reason.trim();
+  if (!trimmed) return { ok: false, message: "확정 해제 사유를 입력하세요." };
+
+  await prisma.customsAdvance.update({
+    where: { id },
+    data: { depositConfirmedAt: null, depositConfirmedByEmail: null },
+  });
+  revalidateAll();
+  return { ok: true };
+}
+
+export async function searchCustomsRecoveryMatchCandidates(
+  partyId: string | null,
+  search: string
+): Promise<MatchCandidate[]> {
+  await requireCustomsAccess();
+  return searchMatchCandidatesLib("deposit", { partyId, search });
+}
+
+export async function createCustomsRecoveryAllocation(
+  id: string,
+  transRefKey: string,
+  amount: number
+): Promise<CustomsVoucherActionResult> {
+  const user = await requireCustomsAccess();
+  const result = await createManualAllocationLib("customsAdvanceRecovery", id, transRefKey, amount, user.email);
+  if (result.ok) revalidateAll();
+  return result;
+}
+
+export async function deleteCustomsRecoveryAllocation(allocationId: string): Promise<CustomsVoucherActionResult> {
   await requireCustomsAccess();
   const result = await deleteAllocationLib(allocationId);
   if (result.ok) revalidateAll();

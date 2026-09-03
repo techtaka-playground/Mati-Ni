@@ -18,13 +18,18 @@ import { matchPartyForRemark, type PartyLite } from "@/lib/bankPartyMatch";
 // 경우만** 자동매칭 후보로 삼는다. 부가세를 포함한 금액이나 여러 B/L에 걸친 출금은 수기 매칭으로
 // 사람이 직접 나눠 배분한다.
 
-export type AllocationKind = "sale" | "purchaseAllocation" | "customsAdvance";
+// customsAdvance는 출금(대납 지급), customsAdvanceRecovery는 입금(회수) — 같은
+// CustomsAdvance 행을 가리키지만 방향이 반대인 별개의 배분 대상이다(2026-09-03 추가,
+// 관세전표 입금 매칭). 하나의 kind가 항상 한 방향으로만 고정되는 게 이 모듈 전체의 전제라서
+// (directionForKind가 그 전제 위에 있다) "customsAdvance"를 양방향으로 겹쳐 쓰지 않고
+// 새 kind를 추가했다.
+export type AllocationKind = "sale" | "purchaseAllocation" | "customsAdvance" | "customsAdvanceRecovery";
 
 // 금액은 원 단위 정수라 반올림 오차만 허용한다.
 const EPS = 0.5;
 
 export function directionForKind(kind: AllocationKind): "deposit" | "withdraw" {
-  return kind === "sale" ? "deposit" : "withdraw";
+  return kind === "sale" || kind === "customsAdvanceRecovery" ? "deposit" : "withdraw";
 }
 
 // "YYYYMMDDHHMMSS" → "YYYY-MM-DD"
@@ -267,6 +272,15 @@ async function getTargetState(
     });
     return a ? { amount: a.amount, confirmedAt: a.settlementConfirmedAt } : null;
   }
+  if (kind === "customsAdvanceRecovery") {
+    // 같은 CustomsAdvance 행이지만 입금(회수) 쪽은 별도 확정 필드를 본다 — 출금 확정 여부와
+    // 무관하게 독립적으로 배분·확정된다.
+    const c = await prisma.customsAdvance.findUnique({
+      where: { id: targetId },
+      select: { amount: true, depositConfirmedAt: true },
+    });
+    return c ? { amount: c.amount, confirmedAt: c.depositConfirmedAt } : null;
+  }
   const c = await prisma.customsAdvance.findUnique({
     where: { id: targetId },
     select: { amount: true, settlementConfirmedAt: true },
@@ -342,7 +356,11 @@ export async function getBankTransactionLinks(): Promise<Record<string, BankTran
 
   const saleIds = allocs.filter((a) => a.kind === "sale").map((a) => a.targetId);
   const paIds = allocs.filter((a) => a.kind === "purchaseAllocation").map((a) => a.targetId);
-  const caIds = allocs.filter((a) => a.kind === "customsAdvance").map((a) => a.targetId);
+  // customsAdvance(출금)·customsAdvanceRecovery(입금)는 같은 CustomsAdvance 행을 가리키므로
+  // 이름 조회는 하나로 합친다.
+  const caIds = allocs
+    .filter((a) => a.kind === "customsAdvance" || a.kind === "customsAdvanceRecovery")
+    .map((a) => a.targetId);
   const [sales, pas, cas] = await Promise.all([
     saleIds.length
       ? prisma.sale.findMany({ where: { id: { in: saleIds } }, select: { id: true, party: { select: { name: true } } } })
@@ -388,7 +406,7 @@ export async function getBankTransactionLinks(): Promise<Record<string, BankTran
       const l = labelFor(targets[0]);
       links[transRefKey] = { kind: l.kind, label: l.text, count: 1 };
     } else {
-      const hasVoucher = targets.some((a) => a.kind !== "customsAdvance");
+      const hasVoucher = targets.some((a) => a.kind === "sale" || a.kind === "purchaseAllocation");
       links[transRefKey] = {
         kind: hasVoucher ? "voucher" : "customs",
         label: `전표 ${targets.length}건 연동`,

@@ -11,6 +11,11 @@ import {
   searchCustomsMatchCandidates,
   createCustomsAllocation,
   deleteCustomsAllocation,
+  confirmCustomsRecovery,
+  unconfirmCustomsRecovery,
+  searchCustomsRecoveryMatchCandidates,
+  createCustomsRecoveryAllocation,
+  deleteCustomsRecoveryAllocation,
 } from "@/app/(app)/customs/actions";
 import { SortableTh } from "@/components/SortableTh";
 import { sortRowsBy, toggleSort, type SortState, type SortValue } from "@/lib/tableSort";
@@ -22,6 +27,8 @@ import { commaInput, numOf } from "@/lib/format";
 export type CustomsTableRow = {
   id: string;
   blNo: string;
+  // 입금(회수) 매칭에 쓰는 거래처 id — partyName/partyCode와 가리키는 대상은 같다.
+  recoveryPartyId: string | null;
   partyName: string | null;
   partyCode: string | null;
   partyFromSale: boolean; // 거래처가 전표 자체가 아니라 연결된 매출에서 온 값인지
@@ -30,10 +37,15 @@ export type CustomsTableRow = {
   payeePartyName: string | null;
   payeePartyCode: string | null;
   taxInvoiceNo: string | null; // 세금계산서에서 등록된 건이면 그 관리번호(O00001 등)
-  // 입금(회수)은 이번 범위 밖이라 예전처럼 계산으로만 보여준다(저장·매칭·확정 대상이 아니다).
+  // 입금(회수)은 2026-09-03부터 출금과 같은 BankAllocation 기반 매칭·확정 흐름이다.
+  depositAllocations: AllocationDetail[];
+  depositAllocatedTotal: number;
+  depositFullyAllocated: boolean;
+  depositBasis: "supply" | "withVat" | null;
   depositDate: string | null;
   depositAmount: number | null;
-  depositBasis: "supply" | "withVat" | null;
+  depositConfirmedAt: string | null;
+  depositConfirmedByEmail: string | null;
   // 출금(대납 지급)은 2026-08-31부터 BankAllocation 기반 — 일반전표와 같은 매칭·확정 흐름.
   withdrawAllocations: AllocationDetail[];
   withdrawAllocatedTotal: number;
@@ -46,6 +58,9 @@ export type CustomsTableRow = {
   matched: boolean;
   paidDate: Date;
   amount: number;
+  currency: string;
+  fxAmount: number | null;
+  fxRate: number | null;
   note: string;
   // 아래 세 값은 화면에서 열을 뺀 뒤로 쓰지 않는다(lib/customs는 계속 내려준다) — 실제 입금은
   // 입출금내역에서 가져오므로 수기 회수 기록을 이 화면에서 다루지 않기로 했다.
@@ -122,17 +137,37 @@ export function CustomsTable({
   const [editingPayeeId, setEditingPayeeId] = useState<string | null>(null);
   const [payeePending, startPayeeTransition] = useTransition();
   const [payeeError, setPayeeError] = useState<string | null>(null);
+  // 출금·입금은 완전히 독립된 두 흐름이라 어느 쪽 팝업인지 kind로 구분한다(2026-09-03,
+  // 입금 매칭 추가 — 일반전표(VoucherTable)가 이미 sale/purchaseAllocation을 이렇게
+  // 구분하는 것과 같은 패턴).
+  type AllocKind = "customsAdvance" | "customsAdvanceRecovery";
+  const directionLabel = (kind: AllocKind) => (kind === "customsAdvance" ? "출금" : "입금");
+
   // "확정"(1단계→2단계) 확인 팝업 — 일반전표와 같은 규칙, 100% 배분 완료된 건만 확정할 수 있다.
-  const [confirmingRow, setConfirmingRow] = useState<CustomsTableRow | null>(null);
+  const [confirmingRow, setConfirmingRow] = useState<{ row: CustomsTableRow; kind: AllocKind } | null>(null);
   const [confirmPending, startConfirmTransition] = useTransition();
   // "확정 해제" 팝업 — 관세전표는 요청/승인 흐름 없이 관리자만 직접 해제한다(2026-08-31, 이번
   // 범위는 매칭+확정까지).
-  const [unconfirmModal, setUnconfirmModal] = useState<{ id: string; blNo: string; reason: string } | null>(null);
+  const [unconfirmModal, setUnconfirmModal] = useState<{
+    id: string;
+    blNo: string;
+    kind: AllocKind;
+    reason: string;
+  } | null>(null);
   const [unconfirmError, setUnconfirmError] = useState<string | null>(null);
   const [unconfirmPending, startUnconfirmTransition] = useTransition();
-  // "매칭"(출금 배분) 팝업 — 일반전표와 같은 패턴.
+  // "매칭"(배분) 팝업 — 일반전표와 같은 패턴. kind로 출금/입금을 구분한다.
   const [matchModal, setMatchModal] = useState<
-    { id: string; blNo: string; partyId: string | null; amount: number; allocatedTotal: number; allocations: AllocationDetail[] } | null
+    | {
+        id: string;
+        blNo: string;
+        kind: AllocKind;
+        partyId: string | null;
+        amount: number;
+        allocatedTotal: number;
+        allocations: AllocationDetail[];
+      }
+    | null
   >(null);
   const [matchCandidates, setMatchCandidates] = useState<MatchCandidate[]>([]);
   const [matchSearch, setMatchSearch] = useState("");
@@ -158,9 +193,10 @@ export function CustomsTable({
 
   function handleConfirm() {
     if (!confirmingRow) return;
-    const id = confirmingRow.id;
+    const { id } = confirmingRow.row;
+    const kind = confirmingRow.kind;
     startConfirmTransition(async () => {
-      await confirmCustomsAdvance(id);
+      await (kind === "customsAdvance" ? confirmCustomsAdvance(id) : confirmCustomsRecovery(id));
       setConfirmingRow(null);
     });
   }
@@ -172,7 +208,10 @@ export function CustomsTable({
       return;
     }
     startUnconfirmTransition(async () => {
-      const result = await unconfirmCustomsAdvance(unconfirmModal.id, unconfirmModal.reason);
+      const result =
+        unconfirmModal.kind === "customsAdvance"
+          ? await unconfirmCustomsAdvance(unconfirmModal.id, unconfirmModal.reason)
+          : await unconfirmCustomsRecovery(unconfirmModal.id, unconfirmModal.reason);
       if (!result.ok) {
         setUnconfirmError(result.message);
         return;
@@ -181,27 +220,33 @@ export function CustomsTable({
     });
   }
 
-  function loadMatchCandidates(partyId: string | null, search: string) {
+  function loadMatchCandidates(kind: AllocKind, partyId: string | null, search: string) {
     startMatchLoadTransition(async () => {
-      setMatchCandidates(await searchCustomsMatchCandidates(partyId, search));
+      setMatchCandidates(
+        await (kind === "customsAdvance"
+          ? searchCustomsMatchCandidates(partyId, search)
+          : searchCustomsRecoveryMatchCandidates(partyId, search))
+      );
     });
   }
 
-  function openMatchModal(r: CustomsTableRow) {
-    const partyId = r.payeePartyId ?? null;
+  function openMatchModal(r: CustomsTableRow, kind: AllocKind) {
+    const isWithdraw = kind === "customsAdvance";
+    const partyId = isWithdraw ? (r.payeePartyId ?? null) : r.recoveryPartyId;
     setMatchModal({
       id: r.id,
       blNo: r.blNo,
+      kind,
       partyId,
       amount: r.amount,
-      allocatedTotal: r.withdrawAllocatedTotal,
-      allocations: r.withdrawAllocations,
+      allocatedTotal: isWithdraw ? r.withdrawAllocatedTotal : r.depositAllocatedTotal,
+      allocations: isWithdraw ? r.withdrawAllocations : r.depositAllocations,
     });
     setSelectedCandidate(null);
     setMatchAmountDisplay("");
     setMatchError(null);
     setMatchSearch("");
-    loadMatchCandidates(partyId, "");
+    loadMatchCandidates(kind, partyId, "");
   }
 
   function selectCandidate(c: MatchCandidate) {
@@ -219,7 +264,9 @@ export function CustomsTable({
       return;
     }
     startMatchSaveTransition(async () => {
-      const result = await createCustomsAllocation(matchModal.id, selectedCandidate.transRefKey, amount);
+      const result = await (matchModal.kind === "customsAdvance"
+        ? createCustomsAllocation(matchModal.id, selectedCandidate.transRefKey, amount)
+        : createCustomsRecoveryAllocation(matchModal.id, selectedCandidate.transRefKey, amount));
       if (!result.ok) {
         setMatchError(result.message);
         return;
@@ -230,8 +277,11 @@ export function CustomsTable({
 
   function handleDeleteAllocation(allocationId: string) {
     setMatchError(null);
+    const kind = matchModal?.kind ?? "customsAdvance";
     startMatchSaveTransition(async () => {
-      const result = await deleteCustomsAllocation(allocationId);
+      const result = await (kind === "customsAdvance"
+        ? deleteCustomsAllocation(allocationId)
+        : deleteCustomsRecoveryAllocation(allocationId));
       if (!result.ok) {
         setMatchError(result.message);
         return;
@@ -279,7 +329,11 @@ export function CustomsTable({
           {sortedRows.map((r) => {
             return (
               <Fragment key={r.id}>
-              <tr className={`border-b border-border/60${r.settlementConfirmedAt ? " bg-accent-soft" : ""}`}>
+              <tr
+                className={`border-b border-border/60${
+                  r.settlementConfirmedAt || r.depositConfirmedAt ? " bg-accent-soft" : ""
+                }`}
+              >
                   <td className="py-2 pr-3 whitespace-nowrap font-medium text-fg">
                     {r.blNo}
                     {/* 세금계산서에서 등록된 게 아니라 이 화면에서 직접 입력한 건임을 표시한다
@@ -368,25 +422,75 @@ export function CustomsTable({
                     )}
                   </td>
                   <td className="py-2 pr-3 text-right num text-pos">
-                    {r.depositAmount != null ? (
-                      // 금액·구분(순입금액/공급가액기준)을 한 줄에 붙이면 줄바꿈이 어색해서
-                      // 세로로 나눈다(2026-08-27).
-                      <div className="flex flex-col items-end leading-tight">
-                        <span>{formatAmount(r.depositAmount)}</span>
-                        <span
-                          className="text-[11px] font-normal text-muted"
-                          title={
-                            r.depositBasis === "withVat"
-                              ? `청구액 ${formatAmount(r.amount)}(공급가액)에 세금계산서 부가세를 더한 실제 입금액입니다.`
-                              : `청구액(공급가액) ${formatAmount(r.amount)}과 그대로 일치하는 입금액입니다.`
-                          }
-                        >
-                          {r.depositBasis === "withVat" ? "순입금액" : "공급가액기준"}
-                        </span>
-                      </div>
-                    ) : (
-                      "-"
-                    )}
+                    {/* 입금(회수)도 2026-09-03부터 출금과 같은 배분·확정 흐름이다 — 별도 열을
+                        새로 만드는 대신 이 칸 안에 매칭/확정 컨트롤을 같이 담는다(열 구조를
+                        건드리지 않기 위함). */}
+                    <div className="flex flex-col items-end gap-0.5 leading-tight">
+                      {r.depositAmount != null ? (
+                        <>
+                          <span>{formatAmount(r.depositAmount)}</span>
+                          <span
+                            className="text-[11px] font-normal text-muted"
+                            title={
+                              r.depositBasis === "withVat"
+                                ? `청구액 ${formatAmount(r.amount)}(공급가액)에 세금계산서 부가세를 더한 실제 입금액입니다.`
+                                : `청구액(공급가액) ${formatAmount(r.amount)}과 그대로 일치하는 입금액입니다.`
+                            }
+                          >
+                            {!r.depositFullyAllocated && `${formatAmount(r.amount)} 중 `}
+                            {r.depositBasis === "withVat" ? "순입금액" : "공급가액기준"}
+                          </span>
+                        </>
+                      ) : (
+                        "-"
+                      )}
+                      {r.depositConfirmedAt ? (
+                        <div className="flex items-center gap-1.5">
+                          <span
+                            className="flex items-center gap-1 text-[11px] font-medium text-accent"
+                            title={
+                              r.depositConfirmedByEmail
+                                ? `${r.depositConfirmedByEmail} · ${new Date(r.depositConfirmedAt).toLocaleString("ko-KR")} 확정`
+                                : "확정됨"
+                            }
+                          >
+                            <IconCheckCircle className="h-3 w-3" />
+                            확정됨
+                          </span>
+                          {isAdmin && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setUnconfirmError(null);
+                                setUnconfirmModal({ id: r.id, blNo: r.blNo, kind: "customsAdvanceRecovery", reason: "" });
+                              }}
+                              className="text-[11px] text-muted hover:underline"
+                            >
+                              해제
+                            </button>
+                          )}
+                        </div>
+                      ) : (
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => openMatchModal(r, "customsAdvanceRecovery")}
+                            className="text-xs text-accent hover:underline"
+                          >
+                            매칭
+                          </button>
+                          {r.depositFullyAllocated && (
+                            <button
+                              type="button"
+                              onClick={() => setConfirmingRow({ row: r, kind: "customsAdvanceRecovery" })}
+                              className="text-xs text-accent hover:underline"
+                            >
+                              확정
+                            </button>
+                          )}
+                        </div>
+                      )}
+                    </div>
                   </td>
 
                   {/* ── 청구 묶음: 우리에게 청구된 관세. 현금 이동이 아니다 ── */}
@@ -394,7 +498,15 @@ export function CustomsTable({
                     {formatDate(r.paidDate)}
                   </td>
                   <td className="py-2 pr-3 text-right num font-medium text-fg">
-                    {formatAmount(r.amount)}
+                    {r.currency !== "KRW" && r.fxAmount != null && r.fxRate != null ? (
+                      <span
+                        title={`${r.currency} ${r.fxAmount.toLocaleString("ko-KR")} × 환율 ${r.fxRate.toLocaleString("ko-KR")}`}
+                      >
+                        {formatAmount(r.amount)}
+                      </span>
+                    ) : (
+                      formatAmount(r.amount)
+                    )}
                   </td>
 
                   {/* ── 출금 묶음: 입출금내역에서 찾은 실제 출금 ── */}
@@ -434,7 +546,7 @@ export function CustomsTable({
                     {!r.settlementConfirmedAt && (
                       <button
                         type="button"
-                        onClick={() => openMatchModal(r)}
+                        onClick={() => openMatchModal(r, "customsAdvance")}
                         className="text-xs text-accent hover:underline"
                       >
                         매칭
@@ -464,7 +576,7 @@ export function CustomsTable({
                             type="button"
                             onClick={() => {
                               setUnconfirmError(null);
-                              setUnconfirmModal({ id: r.id, blNo: r.blNo, reason: "" });
+                              setUnconfirmModal({ id: r.id, blNo: r.blNo, kind: "customsAdvance", reason: "" });
                             }}
                             className="text-xs text-muted hover:underline"
                           >
@@ -477,7 +589,7 @@ export function CustomsTable({
                         {r.withdrawFullyAllocated && (
                           <button
                             type="button"
-                            onClick={() => setConfirmingRow(r)}
+                            onClick={() => setConfirmingRow({ row: r, kind: "customsAdvance" })}
                             className="mr-2 text-xs text-accent hover:underline"
                           >
                             확정
@@ -519,8 +631,8 @@ export function CustomsTable({
             <IconCheckCircle className="h-6 w-6" />
           </span>
           <p className="w-full text-base leading-relaxed text-fg">
-            B/L &quot;{confirmingRow.blNo}&quot; 건의 출금을 확정할까요? 확정 후에는 관리자가 해제하기 전까지
-            삭제할 수 없습니다.
+            B/L &quot;{confirmingRow.row.blNo}&quot; 건의 {directionLabel(confirmingRow.kind)}을 확정할까요?
+            {confirmingRow.kind === "customsAdvance" && " 확정 후에는 관리자가 해제하기 전까지 삭제할 수 없습니다."}
           </p>
           <div className="flex w-full justify-center gap-3">
             <button
@@ -547,9 +659,10 @@ export function CustomsTable({
     {unconfirmModal && (
       <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
         <div className="card flex w-full max-w-md flex-col gap-5 p-7">
-          <h3 className="text-lg font-semibold text-fg">확정 해제</h3>
+          <h3 className="text-lg font-semibold text-fg">{directionLabel(unconfirmModal.kind)} 확정 해제</h3>
           <p className="text-sm text-muted">
-            B/L &quot;{unconfirmModal.blNo}&quot; 건의 확정을 해제합니다. 해제하면 다시 배분을 고칠 수 있습니다.
+            B/L &quot;{unconfirmModal.blNo}&quot; 건의 {directionLabel(unconfirmModal.kind)} 확정을 해제합니다. 해제하면
+            다시 배분을 고칠 수 있습니다.
           </p>
           <div className="flex flex-col gap-1.5">
             <label className="text-sm text-muted">해제 사유</label>
@@ -583,12 +696,14 @@ export function CustomsTable({
       </div>
     )}
 
-    {/* "매칭"(출금 배분) 팝업 — 일반전표와 같은 패턴. */}
+    {/* "매칭"(배분) 팝업 — 일반전표와 같은 패턴. kind로 출금/입금을 구분한다. */}
     {matchModal && (
       <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
         <div className="card flex w-full max-w-3xl flex-col gap-4 p-7">
           <div>
-            <h3 className="text-lg font-semibold text-fg">출금 매칭 — {matchModal.blNo}</h3>
+            <h3 className="text-lg font-semibold text-fg">
+              {directionLabel(matchModal.kind)} 매칭 — {matchModal.blNo}
+            </h3>
             <p className="mt-1 text-sm text-muted">
               청구액 {formatAmount(matchModal.amount)} 중 {formatAmount(matchModal.allocatedTotal)} 배분됨
               {matchModal.amount - matchModal.allocatedTotal > 0 && (
@@ -625,7 +740,7 @@ export function CustomsTable({
                 value={matchSearch}
                 onChange={(e) => {
                   setMatchSearch(e.target.value);
-                  loadMatchCandidates(matchModal.partyId, e.target.value);
+                  loadMatchCandidates(matchModal.kind, matchModal.partyId, e.target.value);
                 }}
                 placeholder="송금인/적요로 검색"
                 className="rounded-md border border-border bg-surface px-3 py-2 text-sm text-fg outline-none focus:border-accent"
@@ -638,7 +753,7 @@ export function CustomsTable({
                   <span>입출금일</span>
                   <span>거래처</span>
                   <span>일치여부</span>
-                  <span className="text-right">출금액</span>
+                  <span className="text-right">{matchModal.kind === "customsAdvance" ? "출금액" : "입금액"}</span>
                   <span className="text-right">분배액</span>
                   <span className="text-right">미분배잔액</span>
                 </div>

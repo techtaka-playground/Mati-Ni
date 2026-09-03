@@ -10,6 +10,10 @@ import { PartySearchSelect, type PartyOption } from "@/components/PartySearchSel
 
 type SaleOption = { id: string; blNo: string; dateStr: string; partyName: string };
 
+// 관세는 해외 선사·항공사가 외화로 청구하는 경우가 흔하다 — 자주 쓰는 통화만 추린다(KRW가
+// 기본이자 대부분). 필요하면 여기 목록만 늘리면 된다.
+const CURRENCIES = ["KRW", "USD", "JPY", "EUR", "CNY", "AUD", "HKD", "GBP"] as const;
+
 // 관세전표 한 줄 빠른입력 — 일반전표(VoucherQuickEntry)와 같은 방식이다. 거래처는 **선택**이고
 // 거래처 마스터에 이미 있는 것만 코드/이름으로 검색해서 고른다(PartySearchSelect). 비워두면
 // blNo로 나중에 매출이 연결될 때 그 매출의 거래처가 보인다.
@@ -29,6 +33,9 @@ export function CustomsQuickEntry({
   const [blNo, setBlNo] = useState("");
   const [paidDate, setPaidDate] = useState("");
   const [amountDisplay, setAmountDisplay] = useState("");
+  const [currency, setCurrency] = useState<string>("KRW");
+  const [fxAmountDisplay, setFxAmountDisplay] = useState("");
+  const [fxRateDisplay, setFxRateDisplay] = useState("");
   const [note, setNote] = useState("");
   const [partyId, setPartyId] = useState<string | null>(null);
   const [payeePartyId, setPayeePartyId] = useState<string | null>(null);
@@ -38,11 +45,20 @@ export function CustomsQuickEntry({
   const dateRef = useRef<HTMLInputElement>(null);
 
   const amount = numOf(amountDisplay);
+  const fxAmount = numOf(fxAmountDisplay);
+  const fxRate = numOf(fxRateDisplay);
+  const isForeign = currency !== "KRW";
+  // 외화일 때 화면에 바로 보여주는 원화 환산 미리보기 — 실제 저장액은 서버가 다시 계산한다
+  // (createCustomsAdvance 주석 참고), 이건 입력 확인용일 뿐이다.
+  const krwPreview = isForeign ? Math.round(fxAmount * fxRate) : amount;
   const match = saleOptions.find((s) => s.blNo === blNo.trim());
 
   function resetLine() {
     setBlNo("");
     setAmountDisplay("");
+    setCurrency("KRW");
+    setFxAmountDisplay("");
+    setFxRateDisplay("");
     setNote("");
     setError(null);
     setSavedFile(null);
@@ -69,12 +85,26 @@ export function CustomsQuickEntry({
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
-    if (!paidDate || !blNo.trim() || !Number.isFinite(amount) || amount === 0) {
+    if (!paidDate || !blNo.trim()) {
       setError("필수 항목을 모두 입력하세요.");
       return;
     }
+    if (isForeign ? fxAmount === 0 || fxRate === 0 : amount === 0) {
+      setError(isForeign ? "외화 금액과 적용 환율을 입력하세요." : "필수 항목을 모두 입력하세요.");
+      return;
+    }
     startTransition(async () => {
-      const result = await createCustomsAdvance({ blNo, paidDate, amount, note, partyId, payeePartyId });
+      const result = await createCustomsAdvance({
+        blNo,
+        paidDate,
+        amount,
+        currency,
+        fxAmount: isForeign ? fxAmount : null,
+        fxRate: isForeign ? fxRate : null,
+        note,
+        partyId,
+        payeePartyId,
+      });
       if (!result.ok) {
         setError(result.message);
         return;
@@ -159,14 +189,57 @@ export function CustomsQuickEntry({
                   />
                 </div>
                 <div className="flex items-center justify-between gap-3">
-                  <span className="text-sm text-muted">청구액</span>
-                  <input
-                    value={amountDisplay}
-                    onChange={(e) => setAmountDisplay(commaInput(e.target.value))}
-                    inputMode="decimal"
-                    className="num w-56 rounded-xl border border-border bg-surface px-3 py-2 text-right text-base text-fg outline-none focus:border-accent focus:ring-2 focus:ring-accent-soft"
-                  />
+                  <span className="text-sm text-muted">통화</span>
+                  <select
+                    value={currency}
+                    onChange={(e) => setCurrency(e.target.value)}
+                    className="w-56 rounded-xl border border-border bg-surface px-3 py-2 text-base text-fg outline-none focus:border-accent focus:ring-2 focus:ring-accent-soft"
+                  >
+                    {CURRENCIES.map((c) => (
+                      <option key={c} value={c}>
+                        {c}
+                      </option>
+                    ))}
+                  </select>
                 </div>
+                {isForeign ? (
+                  <>
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="text-sm text-muted">외화금액 ({currency})</span>
+                      <input
+                        value={fxAmountDisplay}
+                        onChange={(e) => setFxAmountDisplay(commaInput(e.target.value))}
+                        inputMode="decimal"
+                        className="num w-56 rounded-xl border border-border bg-surface px-3 py-2 text-right text-base text-fg outline-none focus:border-accent focus:ring-2 focus:ring-accent-soft"
+                      />
+                    </div>
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="text-sm text-muted">적용환율 ({currency}당 원화)</span>
+                      <input
+                        value={fxRateDisplay}
+                        onChange={(e) => setFxRateDisplay(commaInput(e.target.value))}
+                        inputMode="decimal"
+                        className="num w-56 rounded-xl border border-border bg-surface px-3 py-2 text-right text-base text-fg outline-none focus:border-accent focus:ring-2 focus:ring-accent-soft"
+                      />
+                    </div>
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="text-sm text-muted">원화 환산액</span>
+                      <span className="num w-56 text-right text-base font-medium text-fg">
+                        {krwPreview.toLocaleString("ko-KR")}원
+                      </span>
+                    </div>
+                  </>
+                ) : (
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-sm text-muted">청구액</span>
+                    <input
+                      value={amountDisplay}
+                      onChange={(e) => setAmountDisplay(commaInput(e.target.value))}
+                      inputMode="decimal"
+                      className="num w-56 rounded-xl border border-border bg-surface px-3 py-2 text-right text-base text-fg outline-none focus:border-accent focus:ring-2 focus:ring-accent-soft"
+                    />
+                  </div>
+                )}
                 <div className="flex items-center justify-between gap-3">
                   <span className="text-sm text-muted">비고</span>
                   <input

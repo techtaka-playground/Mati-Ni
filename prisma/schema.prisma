@@ -340,12 +340,22 @@ model CustomsAdvance {
   //     이 컬럼이 없어서 관세전표로 등록한 건에는 그 가드가 적용되지 않았다.
   ntsSendKey String?
   paidDate  DateTime
-  amount    Float // 대납액
+  amount    Float // 대납액 — 항상 원화(KRW) 기준. 외화 입력이어도 환율을 적용해 원화로 환산한 값을
+  // 저장한다. 은행거래 매칭·손익계산 등 기존 로직은 전부 원화 기준으로 그대로 동작한다.
+  // 외화로 수기입력한 경우에만 원래 통화·외화금액·적용환율을 참고용으로 같이 남긴다
+  // (currency가 "KRW"면 fxAmount/fxRate는 항상 null).
+  currency  String   @default("KRW")
+  fxAmount  Float?
+  fxRate    Float?
   note      String   @default("")
   // 대납(출금) 쪽의 "출금 완료(1단계) → 확정(2단계)" 흐름 — Sale/PurchaseAllocation과 같은
-  // 이름·용도. 회수(입금) 쪽은 이번 범위 밖이라 별도 확정 필드를 두지 않는다(2026-08-31).
+  // 이름·용도.
   settlementConfirmedAt      DateTime?
   settlementConfirmedByEmail String?
+  // 회수(입금) 쪽의 확정 — 출금과 완전히 독립된 별도 흐름이라 필드도 따로 둔다(한 전표가
+  // 출금·입금 두 방향을 모두 가지므로 Sale처럼 한 쌍으로는 부족하다, 2026-09-03 추가).
+  depositConfirmedAt      DateTime?
+  depositConfirmedByEmail String?
   createdAt DateTime @default(now())
 
   sale       Sale?             @relation(fields: [saleId], references: [id], onDelete: Cascade)

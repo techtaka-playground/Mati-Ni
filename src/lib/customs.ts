@@ -9,13 +9,15 @@ import {
   type AllocBasis,
   type AllocationDetail,
 } from "@/lib/bankAllocation";
-import { matchPartyForRemark, type PartyLite } from "@/lib/bankPartyMatch";
 import { parseDateInput } from "@/lib/format";
 
 export type CustomsAdvanceRow = {
   id: string;
   saleId: string | null;
   blNo: string;
+  // 입금(회수) 매칭에 실제로 쓰는 거래처 id — partyName/partyCode와 같은 값을 가리키지만
+  // (전표에 직접 지정 or 매출에서 빌려옴) id 자체가 화면에 필요해서 따로 내려준다.
+  recoveryPartyId: string | null;
   partyName: string | null;
   partyCode: string | null;
   // true면 이 거래처가 전표에 직접 지정된 게 아니라 B/L로 연결된 **매출에서 빌려온** 값이다.
@@ -29,11 +31,17 @@ export type CustomsAdvanceRow = {
   matched: boolean;
   // 세금계산서에서 등록된 건이면 그 세금계산서의 내부 관리번호(O00001 등). 직접 입력한 건은 null.
   taxInvoiceNo: string | null;
-  // 입금(회수)은 이번 작업(2026-08-31) 범위 밖이라 예전처럼 계산으로만 보여준다 — 저장되는
-  // 배분·확정 대상이 아니다.
+  // 입금(회수)은 2026-09-03부터 출금과 똑같이 BankAllocation 기반이다(예전엔 그 자리에서
+  // 계산만 하고 저장하지 않았다) — 여러 은행거래에 나눠 배분될 수 있고, 완전히 배분돼야
+  // 확정할 수 있다. 출금 확정과는 완전히 독립된 별도 확정이다(depositConfirmedAt).
+  depositAllocations: AllocationDetail[];
+  depositAllocatedTotal: number;
+  depositFullyAllocated: boolean;
+  depositBasis: AllocBasis | null;
   depositDate: string | null;
   depositAmount: number | null;
-  depositBasis: AllocBasis | null;
+  depositConfirmedAt: string | null;
+  depositConfirmedByEmail: string | null;
   // 출금(대납 지급)은 2026-08-31부터 BankAllocation 기반이다 — 여러 은행거래에 나눠 배분될 수
   // 있고, 완전히 배분돼야 확정할 수 있다(일반전표와 같은 규칙).
   withdrawAllocations: AllocationDetail[];
@@ -46,6 +54,11 @@ export type CustomsAdvanceRow = {
   settlementConfirmedByEmail: string | null;
   paidDate: Date;
   amount: number;
+  // 외화로 수기입력된 건에만 채워진다("KRW"면 fxAmount/fxRate는 항상 null) — amount는
+  // 이미 원화로 환산된 값이라 기존 로직(은행매칭·손익)은 그대로 amount만 쓰면 된다.
+  currency: string;
+  fxAmount: number | null;
+  fxRate: number | null;
   note: string;
   recoveries: { id: string; date: Date; amount: number; note: string }[];
   recoveredTotal: number;
@@ -57,62 +70,6 @@ export type CustomsAdvanceFilter = {
   end?: string; // "YYYY-MM-DD" — 포함(그날 끝까지)
 };
 
-// "YYYYMMDDHHMMSS" → "YYYY-MM-DD"
-function toDate(transDT: string): string {
-  const d = transDT.replace(/\D/g, "");
-  return d.length >= 8 ? `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}` : transDT;
-}
-
-// 입금(회수) 쪽은 저장되는 배분 대상이 아니라서(이번 범위 밖), 예전 bankMatch.ts와 같은
-// "그 자리에서 계산" 방식을 그대로 유지한다 — 청구액(공급가액) 또는 세금계산서 부가세를 더한
-// 금액과 정확히 같고 거래처가 같은 입금을 찾아 보여주기만 한다.
-async function findDepositMatches(
-  entries: { targetId: string; amount: number; partyId: string | null; ntsSendKey: string | null }[]
-): Promise<Map<string, { date: string; amount: number; basis: AllocBasis } | null>> {
-  const result = new Map<string, { date: string; amount: number; basis: AllocBasis } | null>();
-  if (entries.length === 0) return result;
-
-  const ntsSendKeys = entries.map((e) => e.ntsSendKey).filter((k): k is string => !!k);
-  const [bankRows, parties, aliasRows, taxRecords] = await Promise.all([
-    prisma.bankTransaction.findMany({ where: { deposit: { gt: 0 } }, orderBy: { transDT: "asc" } }),
-    prisma.party.findMany({ select: { id: true, code: true, name: true } }),
-    prisma.bankPartyAlias.findMany({ include: { party: { select: { id: true, code: true, name: true } } } }),
-    prisma.taxInvoiceRecord.findMany({
-      where: { ntsSendKey: { in: [...new Set(ntsSendKeys)] } },
-      select: { ntsSendKey: true, taxTotal: true },
-    }),
-  ]);
-  const aliases = new Map<string, PartyLite>(aliasRows.map((a) => [a.normalized, a.party]));
-  const taxByKey = new Map(taxRecords.map((r) => [r.ntsSendKey, r.taxTotal]));
-  const bank = bankRows.map((b) => ({
-    transRefKey: b.transRefKey,
-    transDT: b.transDT,
-    deposit: b.deposit,
-    partyId: matchPartyForRemark(b.transRemark, parties, aliases)?.id ?? null,
-  }));
-
-  for (const e of entries) {
-    if (!e.partyId) {
-      result.set(e.targetId, null);
-      continue;
-    }
-    const tax = e.ntsSendKey ? (taxByKey.get(e.ntsSendKey) ?? null) : null;
-    const candidates: { value: number; basis: AllocBasis }[] = [];
-    if (tax != null && Math.round(tax) !== 0) candidates.push({ value: e.amount + tax, basis: "withVat" });
-    candidates.push({ value: e.amount, basis: "supply" });
-
-    let found: { date: string; amount: number; basis: AllocBasis } | null = null;
-    for (const c of candidates) {
-      const hit = bank.find((b) => b.partyId === e.partyId && Math.round(b.deposit) === Math.round(c.value));
-      if (hit) {
-        found = { date: toDate(hit.transDT), amount: hit.deposit, basis: c.basis };
-        break;
-      }
-    }
-    result.set(e.targetId, found);
-  }
-  return result;
-}
 
 // 관세대납 흐름: 특정 B/L을 대신해 낸 대납액과, 나눠서 회수한 내역을 함께 보여준다.
 // 손익(매출-배분매입)과는 무관한 별도 자금흐름이라 여기서만 다룬다. blNo가 진짜 식별자라
@@ -147,31 +104,39 @@ export async function getCustomsAdvances(filter: CustomsAdvanceFilter = {}): Pro
     partyId: c.payeePartyId ?? c.partyId ?? c.sale?.partyId ?? null,
     ntsSendKey: c.ntsSendKey,
   }));
-  await runAutoMatch(withdrawEntries);
-  const allocByTarget = await getAllocationsByTargets(
-    "customsAdvance",
-    advances.map((c) => c.id)
-  );
-
-  const depositMatches = await findDepositMatches(
-    advances.map((c) => ({
-      targetId: c.id,
-      amount: c.amount,
-      partyId: c.partyId ?? c.sale?.partyId ?? null,
-      ntsSendKey: c.ntsSendKey,
-    }))
-  );
+  // 입금(회수)은 반대로 회수 대상 거래처(고객사) 기준이다 — payeePartyId(지급처)와는 무관하다.
+  const depositEntries = advances.map((c) => ({
+    kind: "customsAdvanceRecovery" as const,
+    targetId: c.id,
+    amount: c.amount,
+    partyId: c.partyId ?? c.sale?.partyId ?? null,
+    ntsSendKey: c.ntsSendKey,
+  }));
+  await runAutoMatch([...withdrawEntries, ...depositEntries]);
+  const [allocByTarget, depositAllocByTarget] = await Promise.all([
+    getAllocationsByTargets(
+      "customsAdvance",
+      advances.map((c) => c.id)
+    ),
+    getAllocationsByTargets(
+      "customsAdvanceRecovery",
+      advances.map((c) => c.id)
+    ),
+  ]);
 
   return advances.map((c) => {
     const recoveredTotal = c.recoveries.reduce((sum, r) => sum + r.amount, 0);
-    const dep = depositMatches.get(c.id) ?? null;
     const withdrawAllocations = allocByTarget.get(c.id) ?? [];
     const withdrawAllocatedTotal = sumAllocated(withdrawAllocations);
     const earliestAlloc = withdrawAllocations[0] ?? null;
+    const depositAllocations = depositAllocByTarget.get(c.id) ?? [];
+    const depositAllocatedTotal = sumAllocated(depositAllocations);
+    const earliestDepositAlloc = depositAllocations[0] ?? null;
     return {
       id: c.id,
       saleId: c.saleId,
       blNo: c.blNo,
+      recoveryPartyId: c.partyId ?? c.sale?.partyId ?? null,
       // 전표에 직접 지정된 거래처가 있으면 그걸 쓰고, 없으면(옛 데이터·미지정) B/L로 연결된
       // 매출의 거래처를 빌려 보여준다 — 예전에는 후자만 있었다.
       partyName: c.party?.name ?? c.sale?.party.name ?? null,
@@ -184,13 +149,21 @@ export async function getCustomsAdvances(filter: CustomsAdvanceFilter = {}): Pro
       taxInvoiceNo: c.ntsSendKey ? (numbers[c.ntsSendKey] ?? null) : null,
       paidDate: c.paidDate,
       amount: c.amount,
+      currency: c.currency,
+      fxAmount: c.fxAmount,
+      fxRate: c.fxRate,
       note: c.note,
       recoveries: c.recoveries,
       recoveredTotal,
       outstanding: c.amount - recoveredTotal,
-      depositDate: dep?.date ?? null,
-      depositAmount: dep?.amount ?? null,
-      depositBasis: dep?.basis ?? null,
+      depositAllocations,
+      depositAllocatedTotal,
+      depositFullyAllocated: isFullyAllocated(c.amount, depositAllocatedTotal),
+      depositBasis: depositAllocatedTotal > 0 ? basisFor(c.amount, depositAllocatedTotal) : null,
+      depositDate: earliestDepositAlloc?.date ?? null,
+      depositAmount: depositAllocatedTotal > 0 ? depositAllocatedTotal : null,
+      depositConfirmedAt: c.depositConfirmedAt ? c.depositConfirmedAt.toISOString() : null,
+      depositConfirmedByEmail: c.depositConfirmedByEmail,
       withdrawAllocations,
       withdrawAllocatedTotal,
       withdrawFullyAllocated: isFullyAllocated(c.amount, withdrawAllocatedTotal),
