@@ -154,13 +154,21 @@ export async function runAutoMatch(entries: AutoMatchEntry[]): Promise<void> {
   for (const a of existingAllocs) consumedByKey.set(a.transRefKey, (consumedByKey.get(a.transRefKey) ?? 0) + a.amount);
   const aliases = new Map<string, PartyLite>(aliasRows.map((a) => [a.normalized, a.party]));
 
-  const bank = bankRows.map((b) => ({
-    transRefKey: b.transRefKey,
-    deposit: b.deposit,
-    withdraw: b.withdraw,
-    remaining: (b.deposit > 0 ? b.deposit : b.withdraw) - (consumedByKey.get(b.transRefKey) ?? 0),
-    partyId: matchPartyForRemark(b.transRemark, parties, aliases)?.id ?? null,
-  }));
+  // 이미 배분이 하나라도 있는 은행거래는 자동매칭 후보에서 뺀다 — 안 그러면 수기로 일부만
+  // 매칭한 직후 남은 잔액이 우연히 다른 미배분 전표 금액과 똑같을 때, 사용자가 고르지도
+  // 않은 그 전표가 페이지를 새로고침하자마자 자동으로 붙어버린다(2026-09-03, 실사례:
+  // 15,659,727원 입금 중 7,495,242원을 수동 매칭했더니 남은 8,164,485원이 다른 관세전표
+  // 금액과 정확히 같아 자동으로 매칭됨). 완전히 손대지 않은 은행거래만 자동매칭 대상이다 —
+  // 나머지 잔액은 항상 사용자가 직접 골라서 매칭한다.
+  const bank = bankRows
+    .filter((b) => !consumedByKey.has(b.transRefKey))
+    .map((b) => ({
+      transRefKey: b.transRefKey,
+      deposit: b.deposit,
+      withdraw: b.withdraw,
+      remaining: b.deposit > 0 ? b.deposit : b.withdraw,
+      partyId: matchPartyForRemark(b.transRemark, parties, aliases)?.id ?? null,
+    }));
 
   const toCreate: { transRefKey: string; kind: AllocationKind; targetId: string; amount: number }[] = [];
   for (const e of unallocated) {
@@ -423,6 +431,42 @@ export async function deleteFxAdjustment(id: string): Promise<AllocationActionRe
   if (target?.confirmedAt) return { ok: false, message: "확정된 건은 먼저 확정을 해제해야 취소할 수 있습니다." };
   await prisma.fxAdjustment.delete({ where: { id } });
   return { ok: true };
+}
+
+// BankAllocation.targetId/FxAdjustment.targetId는 Sale/PurchaseAllocation/CustomsAdvance를
+// 가리키는 일반 문자열이라(kind별로 다른 테이블을 가리키는 다형 관계라 진짜 FK로 걸 수 없다),
+// 그 전표가 삭제되면(또는 매입 삭제로 PurchaseAllocation이 cascade 삭제되면) 이 행들은 DB가
+// 막아주지 못하고 그대로 고아로 남는다 — 그러면 입출금내역의 "전표연동"이 실제로는 아무것도
+// 안 남았는데도 계속 "연동됨"으로 보인다(2026-09-03). 그래서 전표를 지우는 액션마다 이 함수로
+// 정리한다.
+export async function cleanupOrphanedAllocations(): Promise<void> {
+  const [sales, purchaseAllocations, customsAdvances] = await Promise.all([
+    prisma.sale.findMany({ select: { id: true } }),
+    prisma.purchaseAllocation.findMany({ select: { id: true } }),
+    prisma.customsAdvance.findMany({ select: { id: true } }),
+  ]);
+  const saleIds = new Set(sales.map((s) => s.id));
+  const purchaseAllocationIds = new Set(purchaseAllocations.map((p) => p.id));
+  const customsAdvanceIds = new Set(customsAdvances.map((c) => c.id));
+
+  function isOrphaned(kind: string, targetId: string): boolean {
+    if (kind === "sale") return !saleIds.has(targetId);
+    if (kind === "purchaseAllocation") return !purchaseAllocationIds.has(targetId);
+    if (kind === "customsAdvance" || kind === "customsAdvanceRecovery") return !customsAdvanceIds.has(targetId);
+    return false;
+  }
+
+  const [allocs, fxAdjustments] = await Promise.all([
+    prisma.bankAllocation.findMany({ select: { id: true, kind: true, targetId: true } }),
+    prisma.fxAdjustment.findMany({ select: { id: true, kind: true, targetId: true } }),
+  ]);
+  const orphanedAllocIds = allocs.filter((a) => isOrphaned(a.kind, a.targetId)).map((a) => a.id);
+  const orphanedFxIds = fxAdjustments.filter((f) => isOrphaned(f.kind, f.targetId)).map((f) => f.id);
+
+  await Promise.all([
+    orphanedAllocIds.length ? prisma.bankAllocation.deleteMany({ where: { id: { in: orphanedAllocIds } } }) : null,
+    orphanedFxIds.length ? prisma.fxAdjustment.deleteMany({ where: { id: { in: orphanedFxIds } } }) : null,
+  ]);
 }
 
 // ── 입출금내역 화면의 "전표연동" 칸 ──────────────────────────────────────────────────

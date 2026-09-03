@@ -17,6 +17,7 @@ import {
   deleteAllocation as deleteAllocationLib,
   createFxAdjustment as createFxAdjustmentLib,
   deleteFxAdjustment as deleteFxAdjustmentLib,
+  cleanupOrphanedAllocations,
   type MatchCandidate,
 } from "@/lib/bankAllocation";
 
@@ -157,6 +158,7 @@ export async function deleteCustomsAdvance(formData: FormData): Promise<DeleteAc
   if (existing?.settlementConfirmedAt) return { ok: false, reason: "confirmed" };
 
   await prisma.customsAdvance.delete({ where: { id } });
+  await cleanupOrphanedAllocations();
   revalidateAll();
   return { ok: true };
 }

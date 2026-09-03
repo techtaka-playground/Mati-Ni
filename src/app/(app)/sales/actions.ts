@@ -7,6 +7,7 @@ import type { DeleteActionResult } from "@/components/DeleteButton";
 import { extractSaleInvoice, type ExtractedSaleInvoice, type ExtractResult } from "@/lib/invoiceExtract";
 import { requireLoggedIn } from "@/lib/session";
 import { resetOrphanedTaxInvoiceAttachments } from "@/lib/taxInvoiceAttachments";
+import { cleanupOrphanedAllocations } from "@/lib/bankAllocation";
 
 export async function extractSaleInvoicePdf(base64: string): Promise<ExtractResult<ExtractedSaleInvoice>> {
   await requireLoggedIn();
@@ -123,6 +124,7 @@ export async function deleteSale(formData: FormData): Promise<DeleteActionResult
   if (existing?.settlementConfirmedAt) return { ok: false, reason: "confirmed" };
 
   await prisma.sale.delete({ where: { id } });
+  await cleanupOrphanedAllocations();
 
   // 세금계산서에서 등록된 매출이었다면, 그 등록 상태도 함께 초기화한다 — 안 그러면 전표는
   // 지워졌는데 세금계산서 화면에는 여전히 "등록됨"으로 남는다.

@@ -16,6 +16,7 @@ import { parseArgoInvoice } from "@/lib/argoInvoiceParser";
 import { parseAirInvoice } from "@/lib/airInvoiceParser";
 import { requireLoggedIn } from "@/lib/session";
 import { resetOrphanedTaxInvoiceAttachments } from "@/lib/taxInvoiceAttachments";
+import { cleanupOrphanedAllocations } from "@/lib/bankAllocation";
 
 export async function extractPurchaseInvoicePdf(
   base64: string
@@ -248,6 +249,7 @@ export async function deletePurchase(formData: FormData): Promise<DeleteActionRe
   if (existing?.allocations.some((a) => a.settlementConfirmedAt)) return { ok: false, reason: "confirmed" };
 
   await prisma.purchase.delete({ where: { id } });
+  await cleanupOrphanedAllocations();
 
   // 세금계산서에서 등록된 매입이었다면, 그 등록 상태도 함께 초기화한다 — 안 그러면 전표는
   // 지워졌는데 세금계산서 화면에는 여전히 "등록됨"으로 남는다.
