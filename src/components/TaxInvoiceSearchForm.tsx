@@ -3049,6 +3049,10 @@ export function TaxInvoiceSearchForm({
                           <span className="num text-fg">{formatAmount(l.amount)}원</span>
                         </div>
                       ) : (
+                        // 그냥 hover 배경만 주면 "확인" 버튼처럼 눌러야 하는 버튼처럼 안 보여서
+                        // 그동안 하던 대로 아래 "확인"만 누르고 넘어가는 사람이 있었다(2026-09-03
+                        // 재피드백 — "안나오는데?"). 테두리+배경+"선택" 글자로 확실한 버튼
+                        // 모양을 준다.
                         <button
                           key={i}
                           type="button"
@@ -3060,10 +3064,13 @@ export function TaxInvoiceSearchForm({
                             }
                             setConfirmExtractPopupOpen(false);
                           }}
-                          className="flex justify-between rounded-lg px-1.5 py-0.5 text-left hover:bg-accent-soft"
+                          className="flex items-center justify-between rounded-lg border border-accent/40 bg-surface px-3 py-2 text-left hover:border-accent hover:bg-accent-soft"
                         >
                           <span className="text-fg">B/L {l.blNo}</span>
-                          <span className="num text-fg">{formatAmount(l.amount)}원</span>
+                          <span className="flex items-center gap-2">
+                            <span className="num text-fg">{formatAmount(l.amount)}원</span>
+                            <span className="rounded-full bg-accent px-2 py-0.5 text-xs font-medium text-accent-fg">선택</span>
+                          </span>
                         </button>
                       )
                     )}
