@@ -548,11 +548,12 @@ export function CustomsTable({
                   </td>
                   <td className="py-2 pr-3 text-right num font-medium text-fg">
                     {r.currency !== "KRW" && r.fxAmount != null && r.fxRate != null ? (
-                      <span
-                        title={`${r.currency} ${r.fxAmount.toLocaleString("ko-KR")} × 환율 ${r.fxRate.toLocaleString("ko-KR")}`}
-                      >
-                        {formatAmount(r.amount)}
-                      </span>
+                      <div className="flex flex-col items-end gap-0.5 leading-tight">
+                        <span>{formatAmount(r.amount)}</span>
+                        <span className="text-[11px] font-normal text-muted">
+                          {r.currency} {r.fxAmount.toLocaleString("ko-KR")} × 환율 {r.fxRate.toLocaleString("ko-KR")}
+                        </span>
+                      </div>
                     ) : (
                       formatAmount(r.amount)
                     )}
