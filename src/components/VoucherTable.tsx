@@ -12,6 +12,8 @@ import {
   searchMatchCandidates,
   createManualAllocation,
   deleteAllocation,
+  createFxAdjustment,
+  deleteFxAdjustment,
   type VoucherKind,
 } from "@/app/(app)/vouchers/actions";
 import { commaInput, numOf, formatAmount, formatDate } from "@/lib/format";
@@ -19,7 +21,7 @@ import { DeleteButton } from "@/components/DeleteButton";
 import { SortableTh } from "@/components/SortableTh";
 import { sortGroupedRowsBy, toggleSort, type SortState, type SortValue } from "@/lib/tableSort";
 import { IconPlus, IconMinus, IconTreeConnector, IconCheckCircle } from "@/components/icons";
-import type { AllocationDetail, MatchCandidate } from "@/lib/bankAllocation";
+import type { AllocationDetail, FxAdjustmentDetail, MatchCandidate } from "@/lib/bankAllocation";
 
 export type VoucherRow = {
   id: string; // Purchase.id 또는 Sale.id — 수정·삭제(전표 단위 동작) 대상
@@ -53,6 +55,10 @@ export type VoucherRow = {
   // 이 줄에 배분된 실제 입출금 내역(여러 은행거래에 나뉠 수 있다) — **매출은 입금, 매입은
   // 출금**이다(2026-08-31, 저장되는 배분 기반. bankAllocation.ts 참고).
   allocations: AllocationDetail[];
+  // 외화 전표에서, 입력 시점 환율과 실제 결제 환율의 차이로 남는 잔액을 은행거래 없이 직접
+  // 정리한 내역(bankAllocation.ts createFxAdjustment 참고). allocatedTotal에 이미 합산되어
+  // 있다 — 확정 판정은 그 값만 보면 되고, 이 배열은 매칭 팝업에 정리 내역을 보여줄 때만 쓴다.
+  fxAdjustments: FxAdjustmentDetail[];
   allocatedTotal: number;
   fullyAllocated: boolean; // 100% 배분 완료 — 이래야 확정할 수 있다.
   // 입출금 완료(1단계)를 사람이 최종 검토해서 확정(2단계)한 시각 — 값이 있으면 관리자가
@@ -177,7 +183,17 @@ export function VoucherTable({
   // (2026-08-31). 팝업을 여는 시점의 행 정보를 그대로 들고 있다가, 배분 저장/취소가 끝나면
   // 닫는다 — 다시 열면 서버에서 새로 내려온 값으로 갱신된다.
   const [matchModal, setMatchModal] = useState<
-    { kind: VoucherKind; settleId: string; blNo: string; partyId: string; amount: number; allocatedTotal: number; allocations: VoucherRow["allocations"] } | null
+    {
+      kind: VoucherKind;
+      settleId: string;
+      blNo: string;
+      partyId: string;
+      amount: number;
+      currency: string;
+      allocatedTotal: number;
+      allocations: VoucherRow["allocations"];
+      fxAdjustments: VoucherRow["fxAdjustments"];
+    } | null
   >(null);
   const [matchCandidates, setMatchCandidates] = useState<MatchCandidate[]>([]);
   const [matchSearch, setMatchSearch] = useState("");
@@ -186,6 +202,9 @@ export function VoucherTable({
   const [matchAmountDisplay, setMatchAmountDisplay] = useState("");
   const [matchError, setMatchError] = useState<string | null>(null);
   const [matchSavePending, startMatchSaveTransition] = useTransition();
+  // 환차손익으로 정리 — 외화 전표에서 은행거래로는 안 채워지는 남은 잔액을 사유와 함께 직접
+  // 정리한다(2026-09-03). "매칭" 팝업 안에 붙는 작은 기능이라 별도 팝업을 만들지 않았다.
+  const [fxNote, setFxNote] = useState("");
 
   // 한 전표가 B/L별로 여러 줄로 펼쳐지므로 **줄 단위가 아니라 전표 단위로** 정렬한다 —
   // 줄 단위로 정렬하면 같은 전표의 줄들이 흩어져 왼쪽 연결선이 무의미해진다. 정렬 값은 그 전표의
@@ -353,13 +372,16 @@ export function VoucherTable({
       blNo: r.blNo || r.allocLabel,
       partyId: r.partyId,
       amount: r.amount,
+      currency: r.currency,
       allocatedTotal: r.allocatedTotal,
       allocations: r.allocations,
+      fxAdjustments: r.fxAdjustments,
     });
     setSelectedCandidate(null);
     setMatchAmountDisplay("");
     setMatchError(null);
     setMatchSearch("");
+    setFxNote("");
     loadMatchCandidates(kind, r.partyId, "");
   }
 
@@ -391,6 +413,37 @@ export function VoucherTable({
     setMatchError(null);
     startMatchSaveTransition(async () => {
       const result = await deleteAllocation(allocationId);
+      if (!result.ok) {
+        setMatchError(result.message);
+        return;
+      }
+      setMatchModal(null);
+    });
+  }
+
+  // 남은 잔액 **전액**을 환차손익으로 정리한다 — 금액은 서버가 다시 계산하므로 여기서는
+  // 사유만 넘긴다(bankAllocation.ts createFxAdjustment 참고).
+  function handleCreateFxAdjustment() {
+    if (!matchModal) return;
+    if (!fxNote.trim()) {
+      setMatchError("환차손익 처리 사유를 입력하세요.");
+      return;
+    }
+    setMatchError(null);
+    startMatchSaveTransition(async () => {
+      const result = await createFxAdjustment(matchModal.kind, matchModal.settleId, fxNote);
+      if (!result.ok) {
+        setMatchError(result.message);
+        return;
+      }
+      setMatchModal(null);
+    });
+  }
+
+  function handleDeleteFxAdjustment(adjustmentId: string) {
+    setMatchError(null);
+    startMatchSaveTransition(async () => {
+      const result = await deleteFxAdjustment(adjustmentId);
       if (!result.ok) {
         setMatchError(result.message);
         return;
@@ -1048,7 +1101,7 @@ export function VoucherTable({
             </p>
           </div>
 
-          {matchModal.allocations.length > 0 && (
+          {(matchModal.allocations.length > 0 || matchModal.fxAdjustments.length > 0) && (
             <div className="flex flex-col gap-1.5 rounded-lg border border-border p-3">
               <span className="text-xs font-medium text-muted">배분된 내역</span>
               {matchModal.allocations.map((a) => (
@@ -1067,6 +1120,49 @@ export function VoucherTable({
                   </button>
                 </div>
               ))}
+              {matchModal.fxAdjustments.map((a) => (
+                <div key={a.id} className="flex items-center justify-between text-sm">
+                  <span className="text-fg">
+                    {a.date} · {formatAmount(a.amount)}
+                    <span className="ml-1 text-xs text-accent" title={a.note}>
+                      (환차손익 정리)
+                    </span>
+                  </span>
+                  <button
+                    type="button"
+                    disabled={matchSavePending}
+                    onClick={() => handleDeleteFxAdjustment(a.id)}
+                    className="text-xs text-muted hover:underline disabled:opacity-50"
+                  >
+                    정리 취소
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {matchModal.amount - matchModal.allocatedTotal > 0.5 && matchModal.currency !== "KRW" && (
+            <div className="flex flex-col gap-2 rounded-lg border border-accent/30 bg-accent-soft/40 p-3">
+              <span className="text-sm text-fg">
+                남은 잔액 {formatAmount(matchModal.amount - matchModal.allocatedTotal)}원은 외화 입력 시점
+                환율과 실제 결제 환율의 차이일 수 있습니다 — 은행거래를 더 찾지 않고 환차손익으로
+                바로 정리할 수 있습니다.
+              </span>
+              <textarea
+                value={fxNote}
+                onChange={(e) => setFxNote(e.target.value)}
+                placeholder="사유(필수) — 예: 결제일 환율 하락으로 8,000원 부족"
+                rows={2}
+                className="rounded-md border border-border bg-surface px-2.5 py-1.5 text-sm text-fg outline-none focus:border-accent"
+              />
+              <button
+                type="button"
+                disabled={matchSavePending}
+                onClick={handleCreateFxAdjustment}
+                className="w-fit rounded-md bg-accent px-4 py-1.5 text-sm font-medium text-accent-fg hover:bg-accent-hover disabled:opacity-50"
+              >
+                {matchSavePending ? "처리 중..." : "환차손익으로 처리"}
+              </button>
             </div>
           )}
 

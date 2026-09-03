@@ -5,7 +5,14 @@ import { getPurchasesWithAllocations } from "@/lib/purchases";
 import { getParties } from "@/lib/parties";
 import { getSaleOptions } from "@/lib/sales";
 import { getTaxInvoiceNumbersByKeys } from "@/lib/taxInvoiceNumbers";
-import { runAutoMatch, getAllocationsByTargets, sumAllocated, isFullyAllocated } from "@/lib/bankAllocation";
+import {
+  runAutoMatch,
+  getAllocationsByTargets,
+  getFxAdjustmentsByTargets,
+  sumAllocated,
+  sumFxAdjusted,
+  isFullyAllocated,
+} from "@/lib/bankAllocation";
 import { VoucherQuickEntry } from "@/components/VoucherQuickEntry";
 import { DateModeFilterFields } from "@/components/DateModeFilterFields";
 import { VoucherTable, type VoucherRow } from "@/components/VoucherTable";
@@ -74,15 +81,12 @@ export default async function VouchersPage({ searchParams }: { searchParams: SP 
       }))
     ),
   ]);
-  const [saleAllocByTarget, purchaseAllocByTarget] = await Promise.all([
-    getAllocationsByTargets(
-      "sale",
-      sales.map((s) => s.id)
-    ),
-    getAllocationsByTargets(
-      "purchaseAllocation",
-      purchases.flatMap((p) => p.allocations.map((a) => a.id))
-    ),
+  const purchaseAllocIds = purchases.flatMap((p) => p.allocations.map((a) => a.id));
+  const [saleAllocByTarget, purchaseAllocByTarget, saleFxByTarget, purchaseFxByTarget] = await Promise.all([
+    getAllocationsByTargets("sale", sales.map((s) => s.id)),
+    getAllocationsByTargets("purchaseAllocation", purchaseAllocIds),
+    getFxAdjustmentsByTargets("sale", sales.map((s) => s.id)),
+    getFxAdjustmentsByTargets("purchaseAllocation", purchaseAllocIds),
   ]);
 
   // 세금계산서에서 등록된 전표에는 그 세금계산서의 내부 관리번호(I00001/O00001)를 함께 보여준다.
@@ -101,7 +105,8 @@ export default async function VouchersPage({ searchParams }: { searchParams: SP 
   // 매출은 구조상 B/L 1건 = 1행이라 그대로 1줄이다.
   const saleRows: VoucherRow[] = sales.map((s) => {
     const allocations = saleAllocByTarget.get(s.id) ?? [];
-    const allocatedTotal = sumAllocated(allocations);
+    const fxAdjustments = saleFxByTarget.get(s.id) ?? [];
+    const allocatedTotal = sumAllocated(allocations) + sumFxAdjusted(fxAdjustments);
     return {
       id: s.id,
       settleId: s.id,
@@ -122,6 +127,7 @@ export default async function VouchersPage({ searchParams }: { searchParams: SP 
       blIndex: 0,
       blCount: 1,
       allocations,
+      fxAdjustments,
       allocatedTotal,
       fullyAllocated: isFullyAllocated(s.amount, allocatedTotal),
       settlementConfirmedAt: s.settlementConfirmedAt ? s.settlementConfirmedAt.toISOString() : null,
@@ -154,7 +160,8 @@ export default async function VouchersPage({ searchParams }: { searchParams: SP 
     const locked = Boolean(p.ntsSendKey) || allocations.length !== 1;
     return allocations.map((a, idx) => {
       const bankAllocs = a.id ? (purchaseAllocByTarget.get(a.id) ?? []) : [];
-      const allocatedTotal = sumAllocated(bankAllocs);
+      const fxAdjustments = a.id ? (purchaseFxByTarget.get(a.id) ?? []) : [];
+      const allocatedTotal = sumAllocated(bankAllocs) + sumFxAdjusted(fxAdjustments);
       return {
         id: p.id,
         settleId: a.id,
@@ -175,6 +182,7 @@ export default async function VouchersPage({ searchParams }: { searchParams: SP 
         blIndex: idx,
         blCount: allocations.length,
         allocations: bankAllocs,
+        fxAdjustments,
         allocatedTotal,
         fullyAllocated: isFullyAllocated(a.amount, allocatedTotal),
         settlementConfirmedAt: a.settlementConfirmedAt ? a.settlementConfirmedAt.toISOString() : null,

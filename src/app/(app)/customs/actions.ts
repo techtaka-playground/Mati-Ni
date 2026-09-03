@@ -8,11 +8,15 @@ import { extractCustomsInvoice, type ExtractedCustomsInvoice, type ExtractResult
 import { getCurrentUserFresh } from "@/lib/session";
 import {
   getAllocationsByTargets,
+  getFxAdjustmentsByTargets,
   sumAllocated,
+  sumFxAdjusted,
   isFullyAllocated,
   searchMatchCandidates as searchMatchCandidatesLib,
   createManualAllocation as createManualAllocationLib,
   deleteAllocation as deleteAllocationLib,
+  createFxAdjustment as createFxAdjustmentLib,
+  deleteFxAdjustment as deleteFxAdjustmentLib,
   type MatchCandidate,
 } from "@/lib/bankAllocation";
 
@@ -166,7 +170,9 @@ export async function confirmCustomsAdvance(id: string): Promise<CustomsVoucherA
   const advance = await prisma.customsAdvance.findUnique({ where: { id }, select: { amount: true } });
   if (!advance) return { ok: false, message: "대상을 찾을 수 없습니다." };
 
-  const allocated = sumAllocated((await getAllocationsByTargets("customsAdvance", [id])).get(id));
+  const allocated =
+    sumAllocated((await getAllocationsByTargets("customsAdvance", [id])).get(id)) +
+    sumFxAdjusted((await getFxAdjustmentsByTargets("customsAdvance", [id])).get(id));
   if (!isFullyAllocated(advance.amount, allocated)) {
     return { ok: false, message: "출금 배분이 100% 완료되지 않아 확정할 수 없습니다." };
   }
@@ -216,6 +222,22 @@ export async function deleteCustomsAllocation(allocationId: string): Promise<Cus
   return result;
 }
 
+// 외화(달러/엔화 등)로 입력한 관세대납의 남은 미배분 잔액을 은행거래 없이 환차손익으로
+// 정리한다 — VoucherTable의 같은 기능과 같은 이유(bankAllocation.ts createFxAdjustment 참고).
+export async function createCustomsFxAdjustment(id: string, note: string): Promise<CustomsVoucherActionResult> {
+  const user = await requireCustomsAccess();
+  const result = await createFxAdjustmentLib("customsAdvance", id, note, user.email);
+  if (result.ok) revalidateAll();
+  return result;
+}
+
+export async function deleteCustomsFxAdjustment(adjustmentId: string): Promise<CustomsVoucherActionResult> {
+  await requireCustomsAccess();
+  const result = await deleteFxAdjustmentLib(adjustmentId);
+  if (result.ok) revalidateAll();
+  return result;
+}
+
 // ── 입금(회수) 매칭·확정 — 출금과 완전히 독립된 별도 흐름이다(2026-09-03 추가). 같은
 // CustomsAdvance 행이지만 kind는 "customsAdvanceRecovery", 확정 필드는 depositConfirmedAt이라
 // 출금 쪽 확정 여부와 무관하게 따로 배분·확정할 수 있다.
@@ -224,7 +246,9 @@ export async function confirmCustomsRecovery(id: string): Promise<CustomsVoucher
   const advance = await prisma.customsAdvance.findUnique({ where: { id }, select: { amount: true } });
   if (!advance) return { ok: false, message: "대상을 찾을 수 없습니다." };
 
-  const allocated = sumAllocated((await getAllocationsByTargets("customsAdvanceRecovery", [id])).get(id));
+  const allocated =
+    sumAllocated((await getAllocationsByTargets("customsAdvanceRecovery", [id])).get(id)) +
+    sumFxAdjusted((await getFxAdjustmentsByTargets("customsAdvanceRecovery", [id])).get(id));
   if (!isFullyAllocated(advance.amount, allocated)) {
     return { ok: false, message: "입금 배분이 100% 완료되지 않아 확정할 수 없습니다." };
   }
@@ -273,6 +297,20 @@ export async function createCustomsRecoveryAllocation(
 export async function deleteCustomsRecoveryAllocation(allocationId: string): Promise<CustomsVoucherActionResult> {
   await requireCustomsAccess();
   const result = await deleteAllocationLib(allocationId);
+  if (result.ok) revalidateAll();
+  return result;
+}
+
+export async function createCustomsRecoveryFxAdjustment(id: string, note: string): Promise<CustomsVoucherActionResult> {
+  const user = await requireCustomsAccess();
+  const result = await createFxAdjustmentLib("customsAdvanceRecovery", id, note, user.email);
+  if (result.ok) revalidateAll();
+  return result;
+}
+
+export async function deleteCustomsRecoveryFxAdjustment(adjustmentId: string): Promise<CustomsVoucherActionResult> {
+  await requireCustomsAccess();
+  const result = await deleteFxAdjustmentLib(adjustmentId);
   if (result.ok) revalidateAll();
   return result;
 }

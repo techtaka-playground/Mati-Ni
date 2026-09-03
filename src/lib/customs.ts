@@ -2,12 +2,15 @@ import { prisma } from "@/lib/prisma";
 import { getTaxInvoiceNumbersByKeys } from "@/lib/taxInvoiceNumbers";
 import {
   getAllocationsByTargets,
+  getFxAdjustmentsByTargets,
   sumAllocated,
+  sumFxAdjusted,
   isFullyAllocated,
   basisFor,
   runAutoMatch,
   type AllocBasis,
   type AllocationDetail,
+  type FxAdjustmentDetail,
 } from "@/lib/bankAllocation";
 import { parseDateInput } from "@/lib/format";
 
@@ -35,6 +38,11 @@ export type CustomsAdvanceRow = {
   // 계산만 하고 저장하지 않았다) — 여러 은행거래에 나눠 배분될 수 있고, 완전히 배분돼야
   // 확정할 수 있다. 출금 확정과는 완전히 독립된 별도 확정이다(depositConfirmedAt).
   depositAllocations: AllocationDetail[];
+  // 외화(달러/엔화 등)로 입력된 건에서, 입금 시점 환율이 달라 남는 차액을 은행거래 없이 직접
+  // 정리한 내역(bankAllocation.ts createFxAdjustment 참고). depositAllocatedTotal에 이미
+  // 합산되어 있다 — 목록·확정 판정은 이 값만 보면 되고, fxAdjustments는 매칭 팝업에 "정리
+  // 내역"을 보여줄 때만 따로 쓴다.
+  depositFxAdjustments: FxAdjustmentDetail[];
   depositAllocatedTotal: number;
   depositFullyAllocated: boolean;
   depositBasis: AllocBasis | null;
@@ -45,6 +53,7 @@ export type CustomsAdvanceRow = {
   // 출금(대납 지급)은 2026-08-31부터 BankAllocation 기반이다 — 여러 은행거래에 나눠 배분될 수
   // 있고, 완전히 배분돼야 확정할 수 있다(일반전표와 같은 규칙).
   withdrawAllocations: AllocationDetail[];
+  withdrawFxAdjustments: FxAdjustmentDetail[];
   withdrawAllocatedTotal: number;
   withdrawFullyAllocated: boolean;
   withdrawBasis: AllocBasis | null;
@@ -113,24 +122,23 @@ export async function getCustomsAdvances(filter: CustomsAdvanceFilter = {}): Pro
     ntsSendKey: c.ntsSendKey,
   }));
   await runAutoMatch([...withdrawEntries, ...depositEntries]);
-  const [allocByTarget, depositAllocByTarget] = await Promise.all([
-    getAllocationsByTargets(
-      "customsAdvance",
-      advances.map((c) => c.id)
-    ),
-    getAllocationsByTargets(
-      "customsAdvanceRecovery",
-      advances.map((c) => c.id)
-    ),
+  const ids = advances.map((c) => c.id);
+  const [allocByTarget, depositAllocByTarget, withdrawFxByTarget, depositFxByTarget] = await Promise.all([
+    getAllocationsByTargets("customsAdvance", ids),
+    getAllocationsByTargets("customsAdvanceRecovery", ids),
+    getFxAdjustmentsByTargets("customsAdvance", ids),
+    getFxAdjustmentsByTargets("customsAdvanceRecovery", ids),
   ]);
 
   return advances.map((c) => {
     const recoveredTotal = c.recoveries.reduce((sum, r) => sum + r.amount, 0);
     const withdrawAllocations = allocByTarget.get(c.id) ?? [];
-    const withdrawAllocatedTotal = sumAllocated(withdrawAllocations);
+    const withdrawFxAdjustments = withdrawFxByTarget.get(c.id) ?? [];
+    const withdrawAllocatedTotal = sumAllocated(withdrawAllocations) + sumFxAdjusted(withdrawFxAdjustments);
     const earliestAlloc = withdrawAllocations[0] ?? null;
     const depositAllocations = depositAllocByTarget.get(c.id) ?? [];
-    const depositAllocatedTotal = sumAllocated(depositAllocations);
+    const depositFxAdjustments = depositFxByTarget.get(c.id) ?? [];
+    const depositAllocatedTotal = sumAllocated(depositAllocations) + sumFxAdjusted(depositFxAdjustments);
     const earliestDepositAlloc = depositAllocations[0] ?? null;
     return {
       id: c.id,
@@ -157,6 +165,7 @@ export async function getCustomsAdvances(filter: CustomsAdvanceFilter = {}): Pro
       recoveredTotal,
       outstanding: c.amount - recoveredTotal,
       depositAllocations,
+      depositFxAdjustments,
       depositAllocatedTotal,
       depositFullyAllocated: isFullyAllocated(c.amount, depositAllocatedTotal),
       depositBasis: depositAllocatedTotal > 0 ? basisFor(c.amount, depositAllocatedTotal) : null,
@@ -165,6 +174,7 @@ export async function getCustomsAdvances(filter: CustomsAdvanceFilter = {}): Pro
       depositConfirmedAt: c.depositConfirmedAt ? c.depositConfirmedAt.toISOString() : null,
       depositConfirmedByEmail: c.depositConfirmedByEmail,
       withdrawAllocations,
+      withdrawFxAdjustments,
       withdrawAllocatedTotal,
       withdrawFullyAllocated: isFullyAllocated(c.amount, withdrawAllocatedTotal),
       withdrawBasis: withdrawAllocatedTotal > 0 ? basisFor(c.amount, withdrawAllocatedTotal) : null,

@@ -218,6 +218,24 @@ model BankAllocation {
   @@index([kind, targetId])
 }
 
+// 외화(달러·엔화 등)로 입력한 전표는 입력 시점 환율로 원화 환산해 저장하지만, 실제 은행에
+// 찍히는 입출금액은 결제(정산) 시점 환율이 적용돼 거의 항상 그 값과 딱 맞지 않는다 —
+// BankAllocation은 "정확히 같은 금액"만 배분으로 인정하므로, 이 남는 차액은 은행거래를 아무리
+// 찾아도 배분할 수 없어 확정이 영원히 막힌다(2026-09-03). 그래서 은행거래에 연결하지 않고
+// "이 만큼은 환율 차이(환차손익)로 정리한다"를 직접 기록하는 창구를 따로 둔다 — BankAllocation
+// 과 구조는 비슷하지만 transRefKey(실제 은행거래)가 없다는 점이 다르다.
+model FxAdjustment {
+  id             String   @id @default(cuid())
+  kind           String // AllocationKind와 같은 값 — "sale" | "purchaseAllocation" | "customsAdvance" | "customsAdvanceRecovery"
+  targetId       String // Sale.id | PurchaseAllocation.id | CustomsAdvance.id
+  amount         Float // 항상 양수 — 남은 미배분 잔액 전액을 환차손익으로 정리한 금액
+  note           String // 사유(필수) — 예: "결제일 환율 하락으로 8,000원 부족"
+  createdByEmail String
+  createdAt      DateTime @default(now())
+
+  @@index([kind, targetId])
+}
+
 // 거래처 담당자 정보(담당자명·연락처·이메일)를 고칠 때마다 남는 이력. 아무것도 없던 상태에서
 // 처음 채우는 건 "초기설정"(isInitial=true, 사유 입력 불필요)으로 기록하고, 그 뒤 수정은
 // 사유를 반드시 받는다. **수정 전 값을 그대로 남겨야** 나중에 무엇이 어떻게 바뀌었는지

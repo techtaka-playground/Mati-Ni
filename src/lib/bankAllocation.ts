@@ -257,35 +257,39 @@ export type AllocationActionResult = { ok: true } | { ok: false; message: string
 async function getTargetState(
   kind: AllocationKind,
   targetId: string
-): Promise<{ amount: number; confirmedAt: Date | null } | null> {
+): Promise<{ amount: number; confirmedAt: Date | null; currency: string } | null> {
   if (kind === "sale") {
     const s = await prisma.sale.findUnique({
       where: { id: targetId },
-      select: { amount: true, settlementConfirmedAt: true },
+      select: { amount: true, settlementConfirmedAt: true, currency: true },
     });
-    return s ? { amount: s.amount, confirmedAt: s.settlementConfirmedAt } : null;
+    return s ? { amount: s.amount, confirmedAt: s.settlementConfirmedAt, currency: s.currency } : null;
   }
   if (kind === "purchaseAllocation") {
+    // 통화는 배분(PurchaseAllocation)이 아니라 그 부모 Purchase에 있다 — B/L 1개 = 전액 배분인
+    // 수기입력에서만 외화가 들어오므로 이 경로에서는 항상 그 부모 하나뿐이다.
     const a = await prisma.purchaseAllocation.findUnique({
       where: { id: targetId },
-      select: { amount: true, settlementConfirmedAt: true },
+      select: { amount: true, settlementConfirmedAt: true, purchase: { select: { currency: true } } },
     });
-    return a ? { amount: a.amount, confirmedAt: a.settlementConfirmedAt } : null;
+    return a
+      ? { amount: a.amount, confirmedAt: a.settlementConfirmedAt, currency: a.purchase.currency }
+      : null;
   }
   if (kind === "customsAdvanceRecovery") {
     // 같은 CustomsAdvance 행이지만 입금(회수) 쪽은 별도 확정 필드를 본다 — 출금 확정 여부와
     // 무관하게 독립적으로 배분·확정된다.
     const c = await prisma.customsAdvance.findUnique({
       where: { id: targetId },
-      select: { amount: true, depositConfirmedAt: true },
+      select: { amount: true, depositConfirmedAt: true, currency: true },
     });
-    return c ? { amount: c.amount, confirmedAt: c.depositConfirmedAt } : null;
+    return c ? { amount: c.amount, confirmedAt: c.depositConfirmedAt, currency: c.currency } : null;
   }
   const c = await prisma.customsAdvance.findUnique({
     where: { id: targetId },
-    select: { amount: true, settlementConfirmedAt: true },
+    select: { amount: true, settlementConfirmedAt: true, currency: true },
   });
-  return c ? { amount: c.amount, confirmedAt: c.settlementConfirmedAt } : null;
+  return c ? { amount: c.amount, confirmedAt: c.settlementConfirmedAt, currency: c.currency } : null;
 }
 
 export { getTargetState as getAllocationTargetState };
@@ -313,11 +317,13 @@ export async function createManualAllocation(
   const dir = directionForKind(kind);
   const txTotal = dir === "deposit" ? bankTx.deposit : bankTx.withdraw;
 
-  const [targetAgg, txAgg] = await Promise.all([
+  const [targetAgg, txAgg, fxAgg] = await Promise.all([
     prisma.bankAllocation.aggregate({ where: { kind, targetId }, _sum: { amount: true } }),
     prisma.bankAllocation.aggregate({ where: { transRefKey }, _sum: { amount: true } }),
+    prisma.fxAdjustment.aggregate({ where: { kind, targetId }, _sum: { amount: true } }),
   ]);
-  const targetRemaining = target.amount - (targetAgg._sum.amount ?? 0);
+  // 환차손익으로 이미 정리된 몫만큼은 은행거래로도 못 채운다 — 전표 총액을 두 번 채우면 안 되니까.
+  const targetRemaining = target.amount - (targetAgg._sum.amount ?? 0) - (fxAgg._sum.amount ?? 0);
   const txRemaining = txTotal - (txAgg._sum.amount ?? 0);
 
   if (amount > targetRemaining + EPS) {
@@ -337,6 +343,88 @@ export async function deleteAllocation(id: string): Promise<AllocationActionResu
   const target = await getTargetState(alloc.kind as AllocationKind, alloc.targetId);
   if (target?.confirmedAt) return { ok: false, message: "확정된 건은 먼저 확정을 해제해야 배분을 취소할 수 있습니다." };
   await prisma.bankAllocation.delete({ where: { id } });
+  return { ok: true };
+}
+
+// ── 환차손익 정리 — 외화 전표의 남은 차액을 은행거래 없이 직접 정리한다 ──────────────────
+//
+// BankAllocation과 달리 실제 은행거래(transRefKey)가 없다 — "이 만큼은 환율 차이로 설명된다"는
+// 사람의 판단을 기록할 뿐이다. 그래서 화면에 보여줄 때(customs.ts·vouchers/page.tsx)는
+// BankAllocation 합계에 이 합계를 더해서 "배분 완료"로 친다.
+
+export type FxAdjustmentDetail = {
+  id: string;
+  amount: number;
+  note: string;
+  date: string; // 정리한 날짜(createdAt) — AllocationDetail.date와 같은 자리에 쓰기 위해 형식을 맞춘다
+  createdByEmail: string;
+};
+
+export async function getFxAdjustmentsByTargets(
+  kind: AllocationKind,
+  targetIds: string[]
+): Promise<Map<string, FxAdjustmentDetail[]>> {
+  const out = new Map<string, FxAdjustmentDetail[]>();
+  if (targetIds.length === 0) return out;
+  const rows = await prisma.fxAdjustment.findMany({
+    where: { kind, targetId: { in: targetIds } },
+    orderBy: { createdAt: "asc" },
+  });
+  for (const r of rows) {
+    const list = out.get(r.targetId) ?? [];
+    list.push({
+      id: r.id,
+      amount: r.amount,
+      note: r.note,
+      date: r.createdAt.toISOString().slice(0, 10),
+      createdByEmail: r.createdByEmail,
+    });
+    out.set(r.targetId, list);
+  }
+  return out;
+}
+
+export function sumFxAdjusted(details: FxAdjustmentDetail[] | undefined): number {
+  return (details ?? []).reduce((s, d) => s + d.amount, 0);
+}
+
+// 남은 미배분 잔액 **전액**을 환차손익으로 정리한다(부분 정리는 지원하지 않는다 — 얼마가
+// 남았는지는 서버가 다시 계산해서 쓰지, 클라이언트가 보낸 금액을 믿지 않는다). 외화 전표에만
+// 쓸 수 있다 — KRW 전표는 은행 매칭이 안 되는 이유가 환율 차이일 수 없으므로 이 창구를 쓸
+// 이유가 없다.
+export async function createFxAdjustment(
+  kind: AllocationKind,
+  targetId: string,
+  note: string,
+  createdByEmail: string
+): Promise<AllocationActionResult> {
+  const trimmedNote = note.trim();
+  if (!trimmedNote) return { ok: false, message: "환차손익 처리 사유를 입력하세요." };
+
+  const target = await getTargetState(kind, targetId);
+  if (!target) return { ok: false, message: "대상을 찾을 수 없습니다." };
+  if (target.confirmedAt) return { ok: false, message: "이미 확정된 건입니다. 먼저 확정을 해제하세요." };
+  if (target.currency === "KRW") return { ok: false, message: "외화로 입력된 건만 환차손익으로 처리할 수 있습니다." };
+
+  const [bankAgg, fxAgg] = await Promise.all([
+    prisma.bankAllocation.aggregate({ where: { kind, targetId }, _sum: { amount: true } }),
+    prisma.fxAdjustment.aggregate({ where: { kind, targetId }, _sum: { amount: true } }),
+  ]);
+  const remaining = target.amount - (bankAgg._sum.amount ?? 0) - (fxAgg._sum.amount ?? 0);
+  if (remaining <= EPS) return { ok: false, message: "이미 전액 배분되어 정리할 차액이 없습니다." };
+
+  await prisma.fxAdjustment.create({
+    data: { kind, targetId, amount: remaining, note: trimmedNote, createdByEmail },
+  });
+  return { ok: true };
+}
+
+export async function deleteFxAdjustment(id: string): Promise<AllocationActionResult> {
+  const adj = await prisma.fxAdjustment.findUnique({ where: { id } });
+  if (!adj) return { ok: false, message: "환차손익 정리 내역을 찾을 수 없습니다." };
+  const target = await getTargetState(adj.kind as AllocationKind, adj.targetId);
+  if (target?.confirmedAt) return { ok: false, message: "확정된 건은 먼저 확정을 해제해야 취소할 수 있습니다." };
+  await prisma.fxAdjustment.delete({ where: { id } });
   return { ok: true };
 }
 

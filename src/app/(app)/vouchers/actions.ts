@@ -5,11 +5,15 @@ import { prisma } from "@/lib/prisma";
 import { getCurrentUserFresh } from "@/lib/session";
 import {
   getAllocationsByTargets,
+  getFxAdjustmentsByTargets,
   sumAllocated,
+  sumFxAdjusted,
   isFullyAllocated,
   searchMatchCandidates as searchMatchCandidatesLib,
   createManualAllocation as createManualAllocationLib,
   deleteAllocation as deleteAllocationLib,
+  createFxAdjustment as createFxAdjustmentLib,
+  deleteFxAdjustment as deleteFxAdjustmentLib,
   directionForKind,
   type MatchCandidate,
 } from "@/lib/bankAllocation";
@@ -60,7 +64,9 @@ export async function confirmVoucher(kind: VoucherKind, id: string): Promise<Vou
       : (await prisma.purchaseAllocation.findUnique({ where: { id }, select: { amount: true } }))?.amount;
   if (amount == null) return { ok: false, message: "대상을 찾을 수 없습니다." };
 
-  const allocated = sumAllocated((await getAllocationsByTargets(kind, [id])).get(id));
+  const allocated =
+    sumAllocated((await getAllocationsByTargets(kind, [id])).get(id)) +
+    sumFxAdjusted((await getFxAdjustmentsByTargets(kind, [id])).get(id));
   if (!isFullyAllocated(amount, allocated)) {
     return { ok: false, message: "입출금 배분이 100% 완료되지 않아 확정할 수 없습니다." };
   }
@@ -111,6 +117,22 @@ export async function createManualAllocation(
 export async function deleteAllocation(allocationId: string): Promise<VoucherActionResult> {
   await requireVouchersAccess();
   const result = await deleteAllocationLib(allocationId);
+  if (result.ok) revalidateAll();
+  return result;
+}
+
+// 외화 전표의 남은 미배분 잔액(입력 시점 환율 vs 실제 결제 환율 차이)을 은행거래 없이
+// 환차손익으로 정리한다 — KRW 전표에는 쓸 수 없다(createFxAdjustmentLib이 막는다).
+export async function createFxAdjustment(kind: VoucherKind, id: string, note: string): Promise<VoucherActionResult> {
+  const user = await requireVouchersAccess();
+  const result = await createFxAdjustmentLib(kind, id, note, user.email);
+  if (result.ok) revalidateAll();
+  return result;
+}
+
+export async function deleteFxAdjustment(adjustmentId: string): Promise<VoucherActionResult> {
+  await requireVouchersAccess();
+  const result = await deleteFxAdjustmentLib(adjustmentId);
   if (result.ok) revalidateAll();
   return result;
 }
