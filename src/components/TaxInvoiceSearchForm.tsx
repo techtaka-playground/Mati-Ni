@@ -3294,7 +3294,11 @@ export function TaxInvoiceSearchForm({
 
       {editModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <div className="card flex w-full max-w-2xl flex-col gap-5 p-8">
+          {/* 인보이스를 다시 첨부해 여러 B/L이 인식되면(새 파일에서 읽은 내용) + 현재 등록
+              내역 + 수정 사유 + 수정 이력까지 한 번에 다 펼쳐져서, 화면이 작으면 아래
+              저장/취소 버튼이 뷰포트 밖으로 밀려나 있었다(2026-09-03 피드백). 카드 자체에
+              최대 높이를 주고 내부 스크롤로 바꿨다. */}
+          <div className="card flex max-h-[90vh] w-full max-w-2xl flex-col gap-5 overflow-y-auto p-8">
             <h3 className="text-xl font-semibold text-fg">
               승인된 {editModal.direction === "sales" ? "매출" : "매입"} 세금계산서 수정
               {editModal.ntsSendKeys.length > 1 && ` — 묶음 ${editModal.ntsSendKeys.length}건`}
