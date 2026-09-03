@@ -248,7 +248,13 @@ model Sale {
   blNo       String // B/L번호
   date       DateTime // 매출 작성일자 — 월별/BL별/거래처별 손익 집계 기준
   partyId    String
-  amount     Float // 매출액(KRW)
+  amount     Float // 매출액(KRW) — 외화로 수기입력됐으면 이미 원화로 환산된 값
+  // 외화로 수기입력된 건에만 채워진다("KRW"면 fxAmount/fxRate는 항상 null) — amount는 이미
+  // 원화로 환산된 값이라 기존 로직(은행매칭·손익)은 그대로 amount만 쓰면 된다
+  // (CustomsAdvance와 같은 방식, customs.ts 주석 참고).
+  currency   String   @default("KRW")
+  fxAmount   Float?
+  fxRate     Float?
   note       String   @default("")
   ntsSendKey String? // 세금계산서에서 등록됐으면 그 승인번호 — 있으면 전표에서 수정 불가
   confirmedAt DateTime? // 세금계산서 화면에서 "확정"을 누른 시각 — 있으면 B/L 수정 시 사유+이력이 필요해진다
@@ -275,7 +281,12 @@ model Purchase {
   id         String   @id @default(cuid())
   date       DateTime // 매입일자
   partyId    String
-  amount     Float // 매입 총액(KRW)
+  amount     Float // 매입 총액(KRW) — 외화로 수기입력됐으면 이미 원화로 환산된 값
+  // Sale.currency/fxAmount/fxRate와 같은 방식 — 지금은 수기 빠른입력(B/L 1개 = 전액 배분)
+  // 에서만 채워진다. 다건명세서 업로드 등 여러 B/L로 나뉜 매입은 항상 KRW다.
+  currency   String   @default("KRW")
+  fxAmount   Float?
+  fxRate     Float?
   note       String   @default("")
   ntsSendKey String? // 세금계산서에서 등록됐으면 그 승인번호(묶음이면 대표 1건) — 있으면 전표에서 수정 불가
   createdAt  DateTime @default(now())

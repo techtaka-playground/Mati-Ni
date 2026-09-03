@@ -17,18 +17,45 @@ export async function extractSaleInvoicePdf(base64: string): Promise<ExtractResu
   }
 }
 
-export type SaleInput = { blNo: string; date: string; partyId: string; amount: number; note: string };
+export type SaleInput = {
+  blNo: string;
+  date: string;
+  partyId: string;
+  amount: number;
+  note: string;
+  currency?: string;
+  fxAmount?: number | null;
+  fxRate?: number | null;
+};
 export type SaleActionResult = { ok: true } | { ok: false; message: string };
 
 export async function createSale(input: SaleInput): Promise<SaleActionResult> {
   await requireLoggedIn();
   const blNo = input.blNo.trim();
-  if (!blNo || !input.date || !input.partyId || !Number.isFinite(input.amount)) {
+  const currency = (input.currency || "KRW").trim().toUpperCase();
+  if (!blNo || !input.date || !input.partyId) {
     return { ok: false, message: "필수 항목을 모두 입력하세요." };
   }
 
+  // 원화 환산액은 항상 서버에서 계산한다(CustomsAdvance의 createCustomsAdvance와 같은 이유) —
+  // 외화×환율을 클라이언트가 미리 곱해서 보내도 반올림 방식이 다르면 어긋날 수 있다.
+  let amount: number;
+  let fxAmount: number | null = null;
+  let fxRate: number | null = null;
+  if (currency === "KRW") {
+    if (!Number.isFinite(input.amount)) return { ok: false, message: "필수 항목을 모두 입력하세요." };
+    amount = input.amount;
+  } else {
+    if (!Number.isFinite(input.fxAmount) || !Number.isFinite(input.fxRate)) {
+      return { ok: false, message: "외화 금액과 적용 환율을 입력하세요." };
+    }
+    fxAmount = input.fxAmount!;
+    fxRate = input.fxRate!;
+    amount = Math.round(fxAmount * fxRate);
+  }
+
   const sale = await prisma.sale.create({
-    data: { blNo, date: parseDateInput(input.date), partyId: input.partyId, amount: input.amount, note: input.note },
+    data: { blNo, date: parseDateInput(input.date), partyId: input.partyId, amount, currency, fxAmount, fxRate, note: input.note },
   });
 
   // 매입/관세대납이 이 B/L보다 먼저 등록됐을 수 있다 — 같은 blNo로 아직 매칭 안 된

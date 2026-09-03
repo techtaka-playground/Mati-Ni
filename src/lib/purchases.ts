@@ -8,6 +8,9 @@ export type PurchaseRow = {
   partyName: string;
   partyCode: string | null;
   amount: number;
+  currency: string;
+  fxAmount: number | null;
+  fxRate: number | null;
   note: string;
   ntsSendKey: string | null;
   allocations: {
@@ -67,6 +70,9 @@ export async function getPurchasesWithAllocations(filter: PurchaseDateFilter = {
       partyName: p.party.name,
       partyCode: p.party.code,
       amount: p.amount,
+      currency: p.currency,
+      fxAmount: p.fxAmount,
+      fxRate: p.fxRate,
       note: p.note,
       ntsSendKey: p.ntsSendKey,
       allocations,

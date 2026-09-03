@@ -9,6 +9,9 @@ export type SaleRow = {
   partyName: string;
   partyCode: string | null;
   amount: number;
+  currency: string;
+  fxAmount: number | null;
+  fxRate: number | null;
   note: string;
   ntsSendKey: string | null;
   purchaseAmount: number;
@@ -45,6 +48,9 @@ export async function getSalesWithPnl(filter: SaleDateFilter = {}): Promise<Sale
       partyName: s.party.name,
       partyCode: s.party.code,
       amount: s.amount,
+      currency: s.currency,
+      fxAmount: s.fxAmount,
+      fxRate: s.fxRate,
       note: s.note,
       ntsSendKey: s.ntsSendKey,
       purchaseAmount,

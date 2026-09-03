@@ -93,6 +93,9 @@ export type CreatePurchaseInput = {
   amount: number;
   note: string;
   allocations: { blNo: string; amount: number }[];
+  currency?: string;
+  fxAmount?: number | null;
+  fxRate?: number | null;
 };
 
 export type CreatePurchaseResult = { ok: true } | { ok: false; message: string };
@@ -108,16 +111,40 @@ function revalidateAll() {
 // (createSale 참고). 즉 매입을 매출보다 먼저 등록해도 된다.
 export async function createPurchase(input: CreatePurchaseInput): Promise<CreatePurchaseResult> {
   await requireLoggedIn();
-  const { date, partyId, amount, note, allocations } = input;
+  const { date, partyId, note, allocations } = input;
+  const currency = (input.currency || "KRW").trim().toUpperCase();
 
-  if (!date || !partyId || !Number.isFinite(amount) || allocations.length === 0) {
+  if (!date || !partyId || allocations.length === 0) {
     return { ok: false, message: "필수 항목을 모두 입력하세요." };
   }
   if (allocations.some((a) => !a.blNo.trim())) {
     return { ok: false, message: "모든 배분 줄에 B/L 번호를 입력하세요." };
   }
 
-  const allocTotal = allocations.reduce((sum, a) => sum + a.amount, 0);
+  // 원화 환산액은 항상 서버에서 계산한다(createSale·createCustomsAdvance와 같은 이유) —
+  // 외화×환율을 클라이언트가 미리 곱해서 보내도 반올림 방식이 다르면 어긋날 수 있다.
+  let amount: number;
+  let fxAmount: number | null = null;
+  let fxRate: number | null = null;
+  if (currency === "KRW") {
+    if (!Number.isFinite(input.amount)) return { ok: false, message: "필수 항목을 모두 입력하세요." };
+    amount = input.amount;
+  } else {
+    if (!Number.isFinite(input.fxAmount) || !Number.isFinite(input.fxRate)) {
+      return { ok: false, message: "외화 금액과 적용 환율을 입력하세요." };
+    }
+    fxAmount = input.fxAmount!;
+    fxRate = input.fxRate!;
+    amount = Math.round(fxAmount * fxRate);
+  }
+
+  // 외화는 지금까지 항상 B/L 1개 = 전액 배분(일반전표 수기입력)에서만 들어온다 — 배분 줄의
+  // 금액도 서버가 계산한 값으로 맞춘다(클라이언트가 미리 계산해 보낸 값과 반올림이 어긋나지
+  // 않게). 여러 줄(다건명세서 업로드 등)은 항상 KRW라 그대로 둔다.
+  const resolvedAllocations =
+    currency === "KRW" || allocations.length !== 1 ? allocations : [{ ...allocations[0], amount }];
+
+  const allocTotal = resolvedAllocations.reduce((sum, a) => sum + a.amount, 0);
   if (Math.round(allocTotal) !== Math.round(amount)) {
     return {
       ok: false,
@@ -125,7 +152,7 @@ export async function createPurchase(input: CreatePurchaseInput): Promise<Create
     };
   }
 
-  const blNos = [...new Set(allocations.map((a) => a.blNo.trim()))];
+  const blNos = [...new Set(resolvedAllocations.map((a) => a.blNo.trim()))];
   const matchingSales = await prisma.sale.findMany({
     where: { blNo: { in: blNos } },
     select: { id: true, blNo: true },
@@ -137,9 +164,12 @@ export async function createPurchase(input: CreatePurchaseInput): Promise<Create
       date: parseDateInput(date),
       partyId,
       amount,
+      currency,
+      fxAmount,
+      fxRate,
       note,
       allocations: {
-        create: allocations.map((a) => {
+        create: resolvedAllocations.map((a) => {
           const blNo = a.blNo.trim();
           return { blNo, saleId: saleIdByBlNo.get(blNo) ?? null, amount: a.amount };
         }),

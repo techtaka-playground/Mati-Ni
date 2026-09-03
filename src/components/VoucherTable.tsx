@@ -38,6 +38,11 @@ export type VoucherRow = {
   // 세금계산서 대상 금액은 빈 값이다.
   allocLabel: string;
   amount: number; // 이 B/L에 해당하는 금액 — 배분이 여러 건인 매입이면 전표 총액이 아니라 배분액
+  // 외화로 수기입력된 건에만 채워진다("KRW"면 fxAmount/fxRate는 항상 null) — amount는 이미
+  // 원화로 환산된 값이다(CustomsTable과 같은 방식).
+  currency: string;
+  fxAmount: number | null;
+  fxRate: number | null;
   note: string;
   locked: boolean; // 세금계산서에서 등록됐거나(ntsSendKey 있음), 매입인데 배분이 여러 건이라 수정 불가
   // 한 전표가 여러 B/L로 배분되어 여러 줄로 펼쳐질 때 몇 번째 줄인지. 수정·삭제 버튼은 전표
@@ -557,7 +562,15 @@ export function VoucherTable({
                 </span>
               )}
             </td>
-            <td className="py-2 pr-3 text-right num text-fg">{formatAmount(r.amount)}</td>
+            <td className="py-2 pr-3 text-right num text-fg">
+              {r.currency !== "KRW" && r.fxAmount != null && r.fxRate != null ? (
+                <span title={`${r.currency} ${r.fxAmount.toLocaleString("ko-KR")} × 환율 ${r.fxRate.toLocaleString("ko-KR")}`}>
+                  {formatAmount(r.amount)}
+                </span>
+              ) : (
+                formatAmount(r.amount)
+              )}
+            </td>
             <td className={`py-2 pr-3 whitespace-nowrap num text-muted ${GROUP} ${SETTLE_COL}`}>
               {r.allocations[0]?.date ?? (
                 <span
