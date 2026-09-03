@@ -184,7 +184,9 @@ export function CustomsTable({
   const [matchAmountDisplay, setMatchAmountDisplay] = useState("");
   const [matchError, setMatchError] = useState<string | null>(null);
   const [matchSavePending, startMatchSaveTransition] = useTransition();
-  // 환차손익으로 정리 — 일반전표(VoucherTable)와 같은 기능(2026-09-03).
+  // 환차손익으로 정리 — 일반전표(VoucherTable)와 같은 기능(2026-09-03) — "배분" 액션 안에
+  // 합쳐져 있다(VoucherTable의 fxWriteOff 주석 참고).
+  const [fxWriteOff, setFxWriteOff] = useState(false);
   const [fxNote, setFxNote] = useState("");
 
   const onSort = (k: CustomsSortKey) => setSort((p) => toggleSort(p, k));
@@ -258,6 +260,7 @@ export function CustomsTable({
     setMatchAmountDisplay("");
     setMatchError(null);
     setMatchSearch("");
+    setFxWriteOff(false);
     setFxNote("");
     loadMatchCandidates(kind, partyId, "");
   }
@@ -267,13 +270,21 @@ export function CustomsTable({
     setSelectedCandidate(c);
     const remaining = matchModal.amount - matchModal.allocatedTotal;
     setMatchAmountDisplay(commaInput(String(Math.round(Math.min(remaining, c.remaining)))));
+    setFxWriteOff(false);
+    setFxNote("");
   }
 
+  // 배분 저장 — "차액을 환차손익으로 함께 처리" 체크박스를 켰으면 배분 직후 남은 잔액도
+  // 같은 동작 안에서 정리한다(VoucherTable의 같은 함수와 같은 이유).
   function handleSaveMatch() {
     if (!matchModal || !selectedCandidate) return;
     const amount = numOf(matchAmountDisplay);
     if (!(amount > 0)) {
       setMatchError("배분 금액을 입력하세요.");
+      return;
+    }
+    if (fxWriteOff && !fxNote.trim()) {
+      setMatchError("환차손익 처리 사유를 입력하세요.");
       return;
     }
     startMatchSaveTransition(async () => {
@@ -283,6 +294,15 @@ export function CustomsTable({
       if (!result.ok) {
         setMatchError(result.message);
         return;
+      }
+      if (fxWriteOff) {
+        const fxResult = await (matchModal.kind === "customsAdvance"
+          ? createCustomsFxAdjustment(matchModal.id, fxNote)
+          : createCustomsRecoveryFxAdjustment(matchModal.id, fxNote));
+        if (!fxResult.ok) {
+          setMatchError(fxResult.message);
+          return;
+        }
       }
       setMatchModal(null);
     });
@@ -295,27 +315,6 @@ export function CustomsTable({
       const result = await (kind === "customsAdvance"
         ? deleteCustomsAllocation(allocationId)
         : deleteCustomsRecoveryAllocation(allocationId));
-      if (!result.ok) {
-        setMatchError(result.message);
-        return;
-      }
-      setMatchModal(null);
-    });
-  }
-
-  // 남은 잔액 **전액**을 환차손익으로 정리한다 — 금액은 서버가 다시 계산하므로 여기서는
-  // 사유만 넘긴다(bankAllocation.ts createFxAdjustment 참고, VoucherTable과 같은 기능).
-  function handleCreateFxAdjustment() {
-    if (!matchModal) return;
-    if (!fxNote.trim()) {
-      setMatchError("환차손익 처리 사유를 입력하세요.");
-      return;
-    }
-    setMatchError(null);
-    startMatchSaveTransition(async () => {
-      const result = await (matchModal.kind === "customsAdvance"
-        ? createCustomsFxAdjustment(matchModal.id, fxNote)
-        : createCustomsRecoveryFxAdjustment(matchModal.id, fxNote));
       if (!result.ok) {
         setMatchError(result.message);
         return;
@@ -802,31 +801,6 @@ export function CustomsTable({
             </div>
           )}
 
-          {matchModal.amount - matchModal.allocatedTotal > 0.5 && matchModal.currency !== "KRW" && (
-            <div className="flex flex-col gap-2 rounded-lg border border-accent/30 bg-accent-soft/40 p-3">
-              <span className="text-sm text-fg">
-                남은 잔액 {formatAmount(matchModal.amount - matchModal.allocatedTotal)}원은 외화 입력 시점
-                환율과 실제 결제 환율의 차이일 수 있습니다 — 은행거래를 더 찾지 않고 환차손익으로
-                바로 정리할 수 있습니다.
-              </span>
-              <textarea
-                value={fxNote}
-                onChange={(e) => setFxNote(e.target.value)}
-                placeholder="사유(필수) — 예: 결제일 환율 하락으로 8,000원 부족"
-                rows={2}
-                className="rounded-md border border-border bg-surface px-2.5 py-1.5 text-sm text-fg outline-none focus:border-accent"
-              />
-              <button
-                type="button"
-                disabled={matchSavePending}
-                onClick={handleCreateFxAdjustment}
-                className="w-fit rounded-md bg-accent px-4 py-1.5 text-sm font-medium text-accent-fg hover:bg-accent-hover disabled:opacity-50"
-              >
-                {matchSavePending ? "처리 중..." : "환차손익으로 처리"}
-              </button>
-            </div>
-          )}
-
           {matchModal.amount - matchModal.allocatedTotal > 0.5 && (
             <>
               <input
@@ -885,14 +859,45 @@ export function CustomsTable({
               </div>
 
               {selectedCandidate && (
-                <div className="flex items-center gap-2">
-                  <label className="text-sm text-muted">배분 금액</label>
-                  <input
-                    value={matchAmountDisplay}
-                    onChange={(e) => setMatchAmountDisplay(commaInput(e.target.value))}
-                    inputMode="decimal"
-                    className="w-32 rounded-md border border-border bg-surface px-2 py-1.5 text-right text-sm text-fg num"
-                  />
+                <div className="flex flex-col gap-2">
+                  <div className="flex items-center gap-2">
+                    <label className="text-sm text-muted">배분 금액</label>
+                    <input
+                      value={matchAmountDisplay}
+                      onChange={(e) => setMatchAmountDisplay(commaInput(e.target.value))}
+                      inputMode="decimal"
+                      className="w-32 rounded-md border border-border bg-surface px-2 py-1.5 text-right text-sm text-fg num"
+                    />
+                  </div>
+                  {/* 배분 금액을 잔액보다 적게 입력했다는 건, 이 은행거래가 실제로 받은/보낸
+                      진짜 금액은 그거고 나머지는 외화 입력 시점 환율과 실제 결제 환율의 차이라는
+                      뜻일 수 있다 — 체크하면 배분과 동시에 그 차액을 환차손익으로 정리한다
+                      (2026-09-03, VoucherTable과 같은 방식). */}
+                  {matchModal.currency !== "KRW" &&
+                    matchModal.amount - matchModal.allocatedTotal - numOf(matchAmountDisplay) > 0.5 && (
+                      <div className="flex flex-col gap-1.5 rounded-lg border border-accent/30 bg-accent-soft/40 p-2.5">
+                        <label className="flex items-center gap-2 text-sm text-fg">
+                          <input
+                            type="checkbox"
+                            checked={fxWriteOff}
+                            onChange={(e) => setFxWriteOff(e.target.checked)}
+                            className="h-4 w-4 accent-accent"
+                          />
+                          차액{" "}
+                          {formatAmount(matchModal.amount - matchModal.allocatedTotal - numOf(matchAmountDisplay))}원을
+                          환차손익으로 함께 처리
+                        </label>
+                        {fxWriteOff && (
+                          <textarea
+                            value={fxNote}
+                            onChange={(e) => setFxNote(e.target.value)}
+                            placeholder="사유(필수) — 예: 결제일 환율 하락으로 8,000원 부족"
+                            rows={2}
+                            className="rounded-md border border-border bg-surface px-2.5 py-1.5 text-sm text-fg outline-none focus:border-accent"
+                          />
+                        )}
+                      </div>
+                    )}
                 </div>
               )}
             </>
