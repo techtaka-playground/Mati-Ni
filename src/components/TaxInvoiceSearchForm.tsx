@@ -27,6 +27,7 @@ import { formatAmount, commaInput, numOf, formatBizNo, bizNoDigits } from "@/lib
 import { extractBlNoFromRemark, extractAdditionalBlCount } from "@/lib/blNoExtract";
 import type { TaxInvoiceDirection, TaxInvoiceRow } from "@/lib/barobill";
 import type { AttachmentStatus } from "@/lib/taxInvoiceAttachments";
+import { UNISSUED_LABELS } from "@/lib/unissuedLabels";
 import { SortableTh } from "@/components/SortableTh";
 import { PartySearchSelect, type PartyOption } from "@/components/PartySearchSelect";
 import { sortRowsBy, toggleSort, type SortState, type SortValue } from "@/lib/tableSort";
@@ -96,6 +97,16 @@ type EditModalState = {
   extract: { method: "offline" | "ai"; lines: ExtractedLine[] } | null;
   extractError: string | null;
   extractLoading: boolean;
+  // 새 파일 기준 합계가 기존 매입 총액과 안 맞아 배분 반영이 한 번 건너뛰어졌을 때만 채워진다
+  // — 등록 팝업의 "미발행 줄"과 같은 개념으로 차액에 명칭·금액을 직접 지정하는 입력칸을
+  // 띄운다(2026-09-07). 저장을 다시 누르면 이 값을 실어 보낸다. 조정 줄은 W/F·부가세처럼
+  // 2건 이상 나눠 넣을 수 있어 배열이다(같은 요청에서 확장).
+  mismatch: { suggestedAmount: number; existingAdjustments: { label: string; amount: number }[] } | null;
+  manualAdjustments: {
+    label: string; // UNISSUED_LABELS 중 하나
+    customLabel: string; // label === "기타"일 때 직접 입력
+    amountDisplay: string;
+  }[];
 };
 
 // "수정"을 누르면 뜨는 작은 선택 팝업 상태 — 묶음풀기/B/L변경/금액조정 중 하나를 고르면
@@ -196,6 +207,52 @@ function amountMismatchWarning(lines: ExtractedLine[], targetAmount: number): st
   );
 }
 
+// "수정" 팝업의 현재 등록 내역(blRows) 중 진짜 B/L 줄이 아니라 조정(미발행) 줄인지 판단한다
+// — blNo가 비어있거나 명칭(label)이 있으면 조정 줄이고, 옛 데이터 중엔 명칭 대신 blNo 칸에
+// "W/F" 같은 사유 문구가 그대로 들어있는 것도 있어(tax-invoices/actions.ts에서 같은 문제를
+// 겪었다) UNISSUED_LABELS 값도 같이 걸러낸다.
+function isAdjustmentBlRow(b: { blNo: string; label: string }): boolean {
+  return !b.blNo || b.label.trim() !== "" || (UNISSUED_LABELS as readonly string[]).includes(b.blNo);
+}
+
+type ReflectPreviewRow = { blNo: string; text: string; kind: "new" | "changed" | "unchanged" | "adjustment" };
+
+// "저장"을 눌렀을 때 실제로 배분에 무엇이 반영될지 사람이 읽을 수 있게 요약한다 — 서버가
+// 하는 것과 같은 방식으로 같은 B/L끼리 순서대로 짝지어 기존→새 금액을 보여준다(2026-09-07,
+// 반영 전에 내용을 보고 확인받고 싶다는 요청). 커스텀 확인 팝업에서 목록으로 렌더한다
+// (처음엔 window.confirm을 썼는데 브라우저 기본 대화상자라 못생겨서 자체 팝업으로 바꿨다).
+function buildReflectPreviewRows(
+  detail: RegistrationDetail | null,
+  lines: ExtractedLine[],
+  manualAdjustments: { label: string; amount: number }[] | null
+): ReflectPreviewRow[] {
+  const realRows = (detail?.blRows ?? []).filter((b) => !isAdjustmentBlRow(b));
+  const pool = new Map<string, number[]>();
+  for (const b of realRows) pool.set(b.blNo, [...(pool.get(b.blNo) ?? []), b.amount]);
+
+  const rows: ReflectPreviewRow[] = lines.map((l) => {
+    const arr = pool.get(l.blNo);
+    const oldAmount = arr && arr.length > 0 ? arr.shift()! : null;
+    const newText = `${formatAmount(Math.round(l.amount))}원`;
+    if (oldAmount === null) return { blNo: l.blNo, text: `${newText} (새로 추가)`, kind: "new" };
+    if (Math.round(oldAmount) === Math.round(l.amount)) {
+      return { blNo: l.blNo, text: `${newText} (변경 없음)`, kind: "unchanged" };
+    }
+    return { blNo: l.blNo, text: `${formatAmount(Math.round(oldAmount))}원 → ${newText}`, kind: "changed" };
+  });
+
+  const adjustments = manualAdjustments
+    ? manualAdjustments.map((a) => ({ label: a.label, amount: a.amount }))
+    : (detail?.blRows ?? [])
+        .filter((b) => isAdjustmentBlRow(b))
+        .map((b) => ({ label: b.label || b.blNo, amount: b.amount }));
+  for (const a of adjustments) {
+    rows.push({ blNo: a.label, text: `${formatAmount(Math.round(a.amount))}원`, kind: "adjustment" });
+  }
+
+  return rows;
+}
+
 // 인식된 각 줄의 금액을 목표 합계(공급가액)에 맞춰 비율로 축소/확대한다 — 명세서 자체의
 // 합계는 보통 부가세 등이 섞여 있어 목표와 정확히 안 맞을 때가 많다(반올림 오차는 마지막
 // 줄에서 흡수해 합계가 정확히 맞게 만든다). 여러 곳(첨부 즉시 자동 인식/멀티 B/L 팝업/묶어서
@@ -237,7 +294,6 @@ function nearestRemaining(allocTotal: number, targets: number[]): number {
 }
 
 // 세금계산서에 없는(미발행) 금액에 붙일 수 있는 명칭. "기타"를 고르면 직접 입력한다.
-export const UNISSUED_LABELS = ["W/F", "부가세", "영세율", "면세", "해외운임", "기타"] as const;
 
 type UnissuedRow = {
   label: string; // UNISSUED_LABELS 중 하나
@@ -377,6 +433,9 @@ export function TaxInvoiceSearchForm({
     return m && /^\d{4}-\d{2}$/.test(m) ? m : defaultMonth;
   });
   const [taxType, setTaxType] = useState(() => (initialParams.get("taxType") === "3" ? 3 : 1));
+  // 자유 검색 — 거래처명·품목·비고(B/L 등)·승인번호를 대상으로 한다(2026-09-07). 바로빌을
+  // 다시 부르지 않고 이미 조회된 rows 위에서만 걸러낸다.
+  const [searchQuery, setSearchQuery] = useState<string>(() => initialParams.get("q") ?? "");
   const [dateType, setDateType] = useState(() => {
     const d = Number(initialParams.get("dateType"));
     return d === 2 || d === 3 ? d : 1;
@@ -447,7 +506,17 @@ export function TaxInvoiceSearchForm({
   const [detailModal, setDetailModal] = useState<DetailModalState | null>(null);
   const [editModal, setEditModal] = useState<EditModalState | null>(null);
   const [editError, setEditError] = useState<string | null>(null);
+  // "수정" 팝업이 닫힌 뒤에도 배분 반영 결과(반영됐는지/왜 건너뛰었는지)를 볼 수 있어야 한다 —
+  // 팝업 안에서만 잠깐 보여주면 놓치기 쉽다(2026-09-07).
+  const [allocationReflectNotice, setAllocationReflectNotice] = useState<{ ok: boolean; text: string } | null>(null);
   const [editPending, setEditPending] = useState(false);
+  // 배분 반영 전 확인 팝업 — rows는 미리보기 목록, manualAdjustment는 실제 저장 때 그대로
+  // 넘길 값(팝업을 띄운 시점의 편집 상태를 그대로 들고 있어야 "확인" 눌렀을 때 어긋나지
+  // 않는다, 2026-09-07).
+  const [reflectConfirm, setReflectConfirm] = useState<{
+    rows: ReflectPreviewRow[];
+    manualAdjustments: { label: string; amount: number }[] | null;
+  } | null>(null);
   const [amountModal, setAmountModal] = useState<AmountModalState | null>(null);
   const [amountError, setAmountError] = useState<string | null>(null);
   const [amountPending, setAmountPending] = useState(false);
@@ -1002,6 +1071,8 @@ export function TaxInvoiceSearchForm({
       extract: null,
       extractError: null,
       extractLoading: false,
+      mismatch: null,
+      manualAdjustments: [],
     });
     const key = ntsSendKeys[0];
     getTaxInvoiceEditHistory(key).then((result) => {
@@ -1024,11 +1095,23 @@ export function TaxInvoiceSearchForm({
     });
   }
 
-  // 수정 팝업에서 다시 첨부한 PDF의 내용을 읽어 보여준다(등록 흐름과 같은 추출기). 여기서 배분을
-  // 다시 짜지는 않는다 — 금액 배분을 바꾸려면 "묶음 풀기"로 등록을 취소하고 다시 등록해야 한다.
+  // 수정 팝업에서 다시 첨부한 PDF의 내용을 읽어 보여준다(등록 흐름과 같은 추출기). 저장을
+  // 누르면 이 내용이 실제 배분(PurchaseAllocation)에도 반영된다 — 합계가 안 맞으면 아래
+  // 차액 입력칸이 뜬다(handleSaveEdit 참고). 파일을 새로 고르면 이전 파일에서 나왔던 차액
+  // 안내는 더 이상 맞지 않으므로 초기화한다.
   async function handleEditFileChange(file: File | null) {
     setEditModal((prev) =>
-      prev ? { ...prev, file, extract: null, extractError: null, extractLoading: Boolean(file) } : prev
+      prev
+        ? {
+            ...prev,
+            file,
+            extract: null,
+            extractError: null,
+            extractLoading: Boolean(file),
+            mismatch: null,
+            manualAdjustments: [],
+          }
+        : prev
     );
     if (!file) return;
     try {
@@ -1048,7 +1131,33 @@ export function TaxInvoiceSearchForm({
     }
   }
 
-  async function handleSaveEdit() {
+  function handleSaveEdit() {
+    if (!editModal) return;
+    // 직전 저장에서 배분 반영이 합계 불일치로 건너뛰어졌으면(mismatch가 채워져 있으면)
+    // 화면에 띄운 차액 입력칸 값들을 그대로 실어 보낸다 — 등록 팝업의 "미발행 줄"과 같은
+    // 개념(W/F·부가세처럼 여러 줄일 수 있어 배열이다). 명칭이 비어있는 줄(막 추가해서
+    // 아직 안 채운 줄)은 보내지 않는다.
+    const manualAdjustments = editModal.mismatch
+      ? editModal.manualAdjustments
+          .map((a) => ({
+            label: a.label === "기타" ? a.customLabel.trim() : a.label,
+            amount: numOf(a.amountDisplay),
+          }))
+          .filter((a) => a.label)
+      : null;
+    // 새 파일을 첨부해서 배분에도 반영될 수 있으면(매입만), 실제로 반영하기 전에 무엇이
+    // 바뀌는지 요약해 보여주고 확인을 받는다(2026-09-07 요청, 처음엔 window.confirm을
+    // 썼는데 브라우저 기본창이라 못생겨서 자체 팝업으로 바꿨다) — 취소하면 아무것도
+    // 저장하지 않는다.
+    if (editModal.direction === "purchase" && editModal.file && editModal.extract && editModal.extract.lines.length > 0) {
+      const rows = buildReflectPreviewRows(editModal.detail, editModal.extract.lines, manualAdjustments);
+      setReflectConfirm({ rows, manualAdjustments });
+      return;
+    }
+    performSaveEdit(manualAdjustments);
+  }
+
+  async function performSaveEdit(manualAdjustments: { label: string; amount: number }[] | null) {
     if (!editModal) return;
     setEditError(null);
     setEditPending(true);
@@ -1063,12 +1172,45 @@ export function TaxInvoiceSearchForm({
         newBlNo: editModal.newBlNo,
         reason: `[${editModal.reasonCategory}] ${editModal.reason.trim()}`,
         file,
+        manualAdjustments,
       });
       if (!result.ok) {
         setEditError(result.message);
         return;
       }
       setAttachments((prev) => ({ ...prev, ...result.statuses }));
+      if (result.allocationReflect) {
+        const r = result.allocationReflect;
+        if (r.status === "skipped" && r.mismatch) {
+          // 저장(B/L·파일) 자체는 끝났지만 배분 반영만 건너뛰었다 — 팝업을 닫지 않고 차액
+          // 입력칸을 채워서 보여준다. 다시 "저장"을 누르면 이번엔 그 값을 실어 보낸다.
+          const mismatch = r.mismatch;
+          const manualAdjustments =
+            mismatch.existingAdjustments.length > 0
+              ? mismatch.existingAdjustments.map((a) => {
+                  const known = (UNISSUED_LABELS as readonly string[]).includes(a.label);
+                  return {
+                    label: known ? a.label : "기타",
+                    customLabel: known ? "" : a.label,
+                    amountDisplay: commaInput(String(Math.round(a.amount))),
+                  };
+                })
+              : [{ label: "W/F", customLabel: "", amountDisplay: commaInput(String(Math.round(mismatch.suggestedAmount))) }];
+          setEditModal((prev) => (prev ? { ...prev, mismatch, manualAdjustments } : prev));
+          setAllocationReflectNotice({
+            ok: false,
+            text: `배분에는 반영되지 않았습니다 — ${r.reason} 아래 "차액 처리"를 확인하고 다시 저장하세요.`,
+          });
+          return;
+        }
+        setAllocationReflectNotice(
+          r.status === "applied"
+            ? { ok: true, text: `배분에 반영됐습니다 (수정 ${r.updated}건, 추가 ${r.created}건).` }
+            : { ok: false, text: `배분에는 반영되지 않았습니다 — ${r.reason}` }
+        );
+      } else {
+        setAllocationReflectNotice(null);
+      }
       setEditModal(null);
     } catch {
       setEditError("수정 중 오류가 발생했습니다.");
@@ -1528,6 +1670,54 @@ export function TaxInvoiceSearchForm({
     runSearch();
   }, []);
 
+  // "수정" 팝업에서 인보이스를 다시 첨부하면, 저장을 누르기 전에도 새 파일 합계가 기존
+  // 매입 총액과 맞는지 바로 확인해서 차액 입력칸을 미리 채워 보여준다(2026-09-07, 저장을
+  // 한 번 눌러야만 나오는 게 불편하다는 요청) — extract(새 파일 인식)와 detail(현재 등록
+  // 내역)이 둘 다 준비돼야 계산할 수 있어 둘 다 의존성에 둔다. 사용자가 직접 입력칸을
+  // 고치기 시작한 뒤에는(mismatch가 이미 채워진 뒤) 다시 덮어쓰지 않는다.
+  useEffect(() => {
+    if (!editModal?.extract || !editModal.detail || editModal.direction !== "purchase") return;
+    if (editModal.mismatch) return;
+    const newBlTotal = editModal.extract.lines.reduce((sum, l) => sum + l.amount, 0);
+    const existingAdjustments = editModal.detail.blRows.filter(isAdjustmentBlRow);
+    const existingAdjustmentSum = existingAdjustments.reduce((sum, b) => sum + b.amount, 0);
+    const reconciled = Math.round(newBlTotal + existingAdjustmentSum) === Math.round(editModal.detail.totalAmount);
+    // 합계가 이미 맞아떨어져도 기존에 W/F·부가세 등 조정 줄이 있었으면 그대로 사라지지 않고
+    // 보이게 둔다 — 사용자가 매번 확인·수정할 수 있어야 한다(신규 불일치가 없다고 조정 줄
+    // 자체를 숨기면 "잔액이 있는데 왜 안 보이냐"는 혼란이 생긴다, 2026-09-07).
+    if (reconciled && existingAdjustments.length === 0) return;
+
+    const suggestedAmount = Math.round(editModal.detail.totalAmount - newBlTotal);
+    // 조정 줄이 이미 있으면 그 명칭·금액 그대로(합계가 그대로면 그대로 두게, 부족하면 사용자가
+    // "+"로 줄을 늘리거나 금액을 고치면 된다) 각각 한 줄씩 채우고, 하나도 없으면 필요한
+    // 차액 전체를 담은 줄 하나만 만든다.
+    const manualAdjustments =
+      existingAdjustments.length > 0
+        ? existingAdjustments.map((a) => {
+            const rawLabel = a.label || a.blNo;
+            const known = (UNISSUED_LABELS as readonly string[]).includes(rawLabel);
+            return {
+              label: known ? rawLabel : "기타",
+              customLabel: known ? "" : rawLabel,
+              amountDisplay: commaInput(String(Math.round(a.amount))),
+            };
+          })
+        : [{ label: "W/F", customLabel: "", amountDisplay: commaInput(String(suggestedAmount)) }];
+
+    setEditModal((prev) =>
+      prev
+        ? {
+            ...prev,
+            mismatch: {
+              suggestedAmount,
+              existingAdjustments: existingAdjustments.map((a) => ({ label: a.label || a.blNo, amount: a.amount })),
+            },
+            manualAdjustments,
+          }
+        : prev
+    );
+  }, [editModal?.extract, editModal?.detail, editModal?.direction, editModal?.mismatch]);
+
   // 조회조건이 바뀌면 URL에 반영한다(replace라서 뒤로가기 히스토리를 더럽히지 않고,
   // scroll:false라서 화면이 위로 튀지 않는다). 사이드바가 이 URL을 탭별로 기억해두므로
   // 다른 탭에 갔다 돌아오면 같은 조건이 그대로 복원된다.
@@ -1537,12 +1727,13 @@ export function TaxInvoiceSearchForm({
     params.set("month", month);
     if (taxType !== 1) params.set("taxType", String(taxType));
     if (dateType !== 1) params.set("dateType", String(dateType));
+    if (searchQuery.trim()) params.set("q", searchQuery.trim());
     const qs = params.toString();
     // 이미 같은 주소면 아무것도 하지 않는다 — 마운트 직후(URL에서 복원된 경우)의 불필요한
     // replace를 막는다.
     if (window.location.search.replace(/^\?/, "") === qs) return;
     router.replace(`${pathname}?${qs}`, { scroll: false });
-  }, [direction, month, taxType, dateType, pathname, router]);
+  }, [direction, month, taxType, dateType, searchQuery, pathname, router]);
 
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -1611,7 +1802,20 @@ export function TaxInvoiceSearchForm({
 
   function buildDisplayItems(): DisplayItem[] {
     if (!rows) return [];
-    const sortedRows = sortRowsBy(rows, sort, taxSortValue);
+    const q = searchQuery.trim().toLowerCase();
+    const filteredRows = q
+      ? rows.filter((r) => {
+          const blNo = attachments[r.ntsSendKey]?.blNo ?? "";
+          return (
+            r.counterpartCorpName.toLowerCase().includes(q) ||
+            r.itemName.toLowerCase().includes(q) ||
+            r.remark1.toLowerCase().includes(q) ||
+            r.ntsSendKey.toLowerCase().includes(q) ||
+            blNo.toLowerCase().includes(q)
+          );
+        })
+      : rows;
+    const sortedRows = sortRowsBy(filteredRows, sort, taxSortValue);
 
     const groupsByBlNo = new Map<string, TaxInvoiceRow[]>();
     for (const r of sortedRows) {
@@ -2211,6 +2415,10 @@ export function TaxInvoiceSearchForm({
     new Set(Object.values(attachments).map((a) => a.blNo).filter((v): v is string => Boolean(v)))
   ).sort();
 
+  // 렌더당 한 번만 계산한다 — 검색 건수 표시와 표 본문이 같은 결과를 써야 하고, 정렬·묶음
+  // 로직을 두 번 돌릴 필요가 없다.
+  const displayItems = buildDisplayItems();
+
   return (
     <div className="flex flex-col gap-4">
       <datalist id="bl-no-candidates">
@@ -2329,18 +2537,41 @@ export function TaxInvoiceSearchForm({
         </div>
       )}
 
+      {allocationReflectNotice && (
+        <div className={`card flex items-center justify-between p-3 text-sm ${allocationReflectNotice.ok ? "text-pos" : "text-muted"}`}>
+          <span>{allocationReflectNotice.text}</span>
+          <button
+            type="button"
+            onClick={() => setAllocationReflectNotice(null)}
+            className="text-xs text-muted hover:text-fg"
+          >
+            닫기
+          </button>
+        </div>
+      )}
+
       {rows && (
         <div className="card overflow-x-auto p-4">
           <div className="mb-3 flex items-center justify-between">
-            <div className="text-xs text-muted">
+            <div className="flex items-center gap-3 text-xs text-muted">
               {source === "upload" ? (
                 <span>
                   업로드한 파일 기준 ({uploadFileName}) — {rows.length}건
                 </span>
               ) : (
-                <span>{rows.length}건 조회됨</span>
+                <span>
+                  {rows.length}건 조회됨
+                  {searchQuery.trim() && ` · 표시 ${displayItems.length}건`}
+                </span>
               )}
-              {printError && <span className="ml-2 text-neg">{printError}</span>}
+              {printError && <span className="text-neg">{printError}</span>}
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder="거래처·품목·B/L·승인번호 검색"
+                className="w-52 rounded-md border border-border bg-surface px-2 py-1 text-xs text-fg"
+              />
             </div>
             <div className="flex items-center gap-2">
               {selectedKeys.size > 0 && (
@@ -2417,7 +2648,7 @@ export function TaxInvoiceSearchForm({
               <tr aria-hidden="true">
                 <td colSpan={17} className="h-2" />
               </tr>
-              {buildDisplayItems().map((item) =>
+              {displayItems.map((item) =>
                 item.kind === "single" ? (
                   // 묶음 사이에만 여백이 있으면 "묶음만 특별하다"는 인상을 줘서, 묶이지 않은
                   // 건들 사이에도 같은 빈 행으로 똑같이 살짝 띄워준다(renderGroupRow 끝의
@@ -3372,12 +3603,109 @@ export function TaxInvoiceSearchForm({
                         )}
                       </span>
                     </span>
-                    {/* 이 팝업에서는 배분을 다시 짜지 않는다 — 금액 구성을 바꾸려면 등록을 취소하고
-                        다시 등록해야 하므로, 여기서는 "읽힌 값"만 보여주고 그 사실을 알려준다. */}
-                    <span className="text-muted">
-                      금액 배분은 이 팝업에서 바꾸지 않습니다 — 구성을 바꾸려면 아래 "묶음 풀기"로
-                      등록을 취소하고 다시 등록하세요.
-                    </span>
+                  </div>
+                )}
+
+                {editModal.mismatch && (
+                  <div className="flex flex-col gap-2 rounded-xl border border-accent/40 bg-accent-soft/30 px-4 py-3 text-sm">
+                    <span className="text-muted">새 파일 합계가 기존 매입 총액과 맞지 않습니다.</span>
+                    {editModal.manualAdjustments.map((adj, i) => (
+                      <div key={i} className="flex gap-3">
+                        <select
+                          value={adj.label}
+                          onChange={(e) =>
+                            setEditModal((prev) => {
+                              if (!prev) return prev;
+                              const next = [...prev.manualAdjustments];
+                              next[i] = { ...next[i], label: e.target.value };
+                              return { ...prev, manualAdjustments: next };
+                            })
+                          }
+                          className="w-32 shrink-0 rounded-lg border border-border bg-surface px-2 py-1.5 text-sm text-fg"
+                        >
+                          {UNISSUED_LABELS.map((l) => (
+                            <option key={l} value={l}>
+                              {l}
+                            </option>
+                          ))}
+                        </select>
+                        {adj.label === "기타" && (
+                          <input
+                            value={adj.customLabel}
+                            onChange={(e) =>
+                              setEditModal((prev) => {
+                                if (!prev) return prev;
+                                const next = [...prev.manualAdjustments];
+                                next[i] = { ...next[i], customLabel: e.target.value };
+                                return { ...prev, manualAdjustments: next };
+                              })
+                            }
+                            placeholder="명칭"
+                            className="w-24 rounded-lg border border-border bg-surface px-2 py-1.5 text-sm text-fg"
+                          />
+                        )}
+                        <input
+                          value={adj.amountDisplay}
+                          onChange={(e) =>
+                            setEditModal((prev) => {
+                              if (!prev) return prev;
+                              const next = [...prev.manualAdjustments];
+                              next[i] = { ...next[i], amountDisplay: commaInput(e.target.value) };
+                              return { ...prev, manualAdjustments: next };
+                            })
+                          }
+                          placeholder="금액"
+                          className="flex-1 rounded-lg border border-border bg-surface px-2 py-1.5 text-right text-sm text-fg"
+                        />
+                        <span className="self-center text-muted">원</span>
+                        {/* 줄이 하나뿐이면 지우기 버튼을 안 둔다 — 조정 줄 자체를 아예 없애려면
+                            (합계를 딱 맞추는 자리라 필요) 최소 하나는 남아야 한다. */}
+                        {editModal.manualAdjustments.length > 1 && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setEditModal((prev) =>
+                                prev
+                                  ? { ...prev, manualAdjustments: prev.manualAdjustments.filter((_, j) => j !== i) }
+                                  : prev
+                              )
+                            }
+                            className="self-center text-muted hover:text-neg"
+                            title="이 줄 삭제"
+                          >
+                            ✕
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                    <div className="flex items-center justify-between">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setEditModal((prev) =>
+                            prev
+                              ? {
+                                  ...prev,
+                                  manualAdjustments: [
+                                    ...prev.manualAdjustments,
+                                    { label: "W/F", customLabel: "", amountDisplay: "" },
+                                  ],
+                                }
+                              : prev
+                          )
+                        }
+                        className="text-xs text-accent hover:underline"
+                      >
+                        + 조정 줄 추가
+                      </button>
+                      <span className="text-xs text-muted">
+                        입력한 합계{" "}
+                        {formatAmount(
+                          Math.round(editModal.manualAdjustments.reduce((sum, a) => sum + numOf(a.amountDisplay), 0))
+                        )}
+                        원 · 필요 {formatAmount(Math.round(editModal.mismatch.suggestedAmount))}원
+                      </span>
+                    </div>
                   </div>
                 )}
               </div>
@@ -3447,7 +3775,7 @@ export function TaxInvoiceSearchForm({
                     value={editModal.reason}
                     onChange={(e) => setEditModal((prev) => (prev ? { ...prev, reason: e.target.value } : prev))}
                     rows={2}
-                    placeholder="예: B/L 오타 정정, 인보이스 재발행분으로 교체 등"
+                    placeholder="사유 작성 시 수정이 가능합니다"
                     className="flex-1 rounded-xl border border-border bg-surface px-3 py-2 text-base text-fg outline-none focus:border-accent focus:ring-2 focus:ring-accent-soft"
                   />
                 </div>
@@ -3530,6 +3858,56 @@ export function TaxInvoiceSearchForm({
                   {editPending ? "저장 중..." : "수정 저장"}
                 </button>
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 배분 반영 전 확인 팝업 — "수정" 팝업 위에 뜬다(z가 더 높다). window.confirm 대신
+          쓰는 이유는 buildReflectPreviewRows 주석 참고. */}
+      {reflectConfirm && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/40 p-4">
+          <div className="card flex max-h-[80vh] w-full max-w-md flex-col gap-4 p-6">
+            <h3 className="text-lg font-semibold text-fg">배분 반영 확인</h3>
+            <p className="text-sm text-muted">다음과 같이 실제 배분에 반영합니다.</p>
+            <div className="flex flex-col gap-1 overflow-y-auto rounded-xl bg-gray-95 px-4 py-3 text-sm">
+              {reflectConfirm.rows.map((r, i) => (
+                <span
+                  key={`${r.blNo}-${i}`}
+                  className={`flex justify-between gap-3 ${
+                    r.kind === "adjustment" ? "mt-1 border-t border-border pt-2 font-medium" : ""
+                  }`}
+                >
+                  <span className={`num ${r.kind === "unchanged" ? "text-muted" : "text-fg"}`}>{r.blNo}</span>
+                  <span
+                    className={`num ${
+                      r.kind === "new" ? "text-accent" : r.kind === "unchanged" ? "text-muted" : "text-fg"
+                    }`}
+                  >
+                    {r.text}
+                  </span>
+                </span>
+              ))}
+            </div>
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setReflectConfirm(null)}
+                className="rounded-xl px-5 py-2.5 text-base text-muted hover:text-fg"
+              >
+                취소
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const adjustments = reflectConfirm.manualAdjustments;
+                  setReflectConfirm(null);
+                  performSaveEdit(adjustments);
+                }}
+                className="rounded-xl bg-accent px-6 py-2.5 text-base font-medium text-accent-fg hover:bg-accent-hover"
+              >
+                확인
+              </button>
             </div>
           </div>
         </div>

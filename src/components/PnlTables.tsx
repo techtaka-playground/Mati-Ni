@@ -5,6 +5,7 @@ import { SortableTh } from "@/components/SortableTh";
 import { formatAmount } from "@/lib/format";
 import { sortRowsBy, toggleSort, type SortState, type SortValue } from "@/lib/tableSort";
 import type { PnlSummary } from "@/lib/pnl";
+import { buildPnlSummaryReportHtml, buildPnlBlReportHtml } from "@/lib/pnlReport";
 
 // 손익조회의 세 탭 표를 클라이언트 컴포넌트로 뽑았다 — 열 정렬은 서버를 다시 부를 필요가 없는데
 // 페이지가 서버 컴포넌트라 useState를 쓸 수 없었다. 집계는 계속 서버에서 하고 여기서는 정렬·
@@ -33,6 +34,41 @@ function downloadCsv(filename: string, headers: string[], rows: (string | number
   URL.revokeObjectURL(url);
 }
 
+// "보고서 다운로드" — bankSlip.ts와 같은 방식(화면 밖 숨긴 iframe에 인쇄용 HTML을 넣고 바로
+// 인쇄 대화상자를 띄운다, "PDF로 저장"이 곧 다운로드다). 화면엔 팝업을 띄우지 않는다.
+function openPrintableReport(html: string) {
+  const iframe = document.createElement("iframe");
+  iframe.style.position = "fixed";
+  iframe.style.right = "0";
+  iframe.style.bottom = "0";
+  iframe.style.width = "0";
+  iframe.style.height = "0";
+  iframe.style.border = "none";
+  iframe.srcdoc = html;
+
+  let removed = false;
+  function cleanup() {
+    if (removed) return;
+    removed = true;
+    iframe.remove();
+  }
+  iframe.addEventListener("load", () => {
+    iframe.contentWindow?.addEventListener("afterprint", cleanup);
+  });
+  setTimeout(cleanup, 5 * 60 * 1000);
+
+  document.body.appendChild(iframe);
+}
+
+// 보고서 머리말에 쓸 공통 정보 — 조회조건/작성자/회사명은 페이지(서버 컴포넌트)가 알고
+// 있으므로 prop으로 받는다.
+export type PnlReportMeta = {
+  corpName: string;
+  generatedByEmail: string;
+  periodLabel: string;
+  partyFilterLabel: string | null;
+};
+
 type SummarySortKey = "code" | "label" | "count" | "saleAmount" | "purchaseAmount" | "profit";
 
 function summarySortValue(r: PnlSummary, key: SummarySortKey): SortValue {
@@ -46,12 +82,18 @@ export function PnlSummaryTable({
   labelHeader,
   codeHeader,
   downloadLabel,
+  reportTitle,
+  reportMeta,
 }: {
   rows: PnlSummary[];
   labelHeader: string;
   codeHeader?: string;
   // 엑셀 다운로드 파일명에 쓸 구분자("월별손익"/"거래처별손익") — 안 주면 다운로드 버튼을 숨긴다.
   downloadLabel?: string;
+  // "보고서 다운로드" 버튼 제목("월별 손익 보고서" 등)과 머리말 정보 — 둘 다 있어야 버튼이 보인다
+  // (downloadLabel과 같은 규칙).
+  reportTitle?: string;
+  reportMeta?: PnlReportMeta;
 }) {
   const [sort, setSort] = useState<SortState<SummarySortKey>>(null);
   const sorted = sortRowsBy(rows, sort, summarySortValue);
@@ -87,18 +129,42 @@ export function PnlSummaryTable({
     );
   }
 
+  function handleReport() {
+    if (!reportTitle || !reportMeta) return;
+    const html = buildPnlSummaryReportHtml({
+      title: reportTitle,
+      labelHeader,
+      codeHeader,
+      rows: sorted,
+      meta: { ...reportMeta, printedAt: new Date() },
+    });
+    openPrintableReport(html);
+  }
+
   return (
     <div className="flex flex-col gap-3">
-      {downloadLabel && (
-        <div className="flex justify-end">
-          <button
-            type="button"
-            disabled={rows.length === 0}
-            onClick={handleDownload}
-            className="rounded-md bg-gray-95 px-3 py-1.5 text-xs font-medium text-fg hover:bg-gray-90 disabled:opacity-50"
-          >
-            엑셀 다운로드
-          </button>
+      {(downloadLabel || (reportTitle && reportMeta)) && (
+        <div className="flex justify-end gap-2">
+          {reportTitle && reportMeta && (
+            <button
+              type="button"
+              disabled={rows.length === 0}
+              onClick={handleReport}
+              className="rounded-md bg-gray-95 px-3 py-1.5 text-xs font-medium text-fg hover:bg-gray-90 disabled:opacity-50"
+            >
+              보고서 다운로드
+            </button>
+          )}
+          {downloadLabel && (
+            <button
+              type="button"
+              disabled={rows.length === 0}
+              onClick={handleDownload}
+              className="rounded-md bg-gray-95 px-3 py-1.5 text-xs font-medium text-fg hover:bg-gray-90 disabled:opacity-50"
+            >
+              엑셀 다운로드
+            </button>
+          )}
         </div>
       )}
       <table className="w-full min-w-[680px] text-sm">
@@ -171,7 +237,7 @@ export type PnlBlRow = {
 
 type BlSortKey = "date" | "blNo" | "partyCode" | "partyName" | "saleAmount" | "purchaseAmount" | "profit";
 
-export function PnlBlTable({ rows }: { rows: PnlBlRow[] }) {
+export function PnlBlTable({ rows, reportMeta }: { rows: PnlBlRow[]; reportMeta?: PnlReportMeta }) {
   const [sort, setSort] = useState<SortState<BlSortKey>>(null);
   const sorted = sortRowsBy(rows, sort, (r, k) => r[k]);
   const onSort = (k: BlSortKey) => setSort((prev) => toggleSort(prev, k));
@@ -203,9 +269,25 @@ export function PnlBlTable({ rows }: { rows: PnlBlRow[] }) {
     );
   }
 
+  function handleReport() {
+    if (!reportMeta) return;
+    const html = buildPnlBlReportHtml({ rows: sorted, meta: { ...reportMeta, printedAt: new Date() } });
+    openPrintableReport(html);
+  }
+
   return (
     <div className="flex flex-col gap-3">
-      <div className="flex justify-end">
+      <div className="flex justify-end gap-2">
+        {reportMeta && (
+          <button
+            type="button"
+            disabled={rows.length === 0}
+            onClick={handleReport}
+            className="rounded-md bg-gray-95 px-3 py-1.5 text-xs font-medium text-fg hover:bg-gray-90 disabled:opacity-50"
+          >
+            보고서 다운로드
+          </button>
+        )}
         <button
           type="button"
           disabled={rows.length === 0}

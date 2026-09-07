@@ -224,6 +224,9 @@ export function BankLogSearchForm({
       return v === "confirmed" || v === "unconfirmed" || v === "excluded" ? v : "all";
     }
   );
+  // 자유 검색 — 송금인/적요·거래처·비고를 대상으로 한다(2026-09-07). 바로빌을 다시 부르지
+  // 않고 이미 조회된 rows 위에서만 걸러낸다 — 다른 필터(확정/구분)와 같은 방식.
+  const [searchQuery, setSearchQuery] = useState<string>(() => initialParams.get("q") ?? "");
 
   // 정렬은 조회 결과를 화면에서만 다시 늘어놓는 것이다 — 바로빌을 다시 부르지 않는다.
   // 건수는 **필터와 무관하게 조회 결과 전체**를 센다 — 필터를 걸면 숫자도 같이 줄어들면
@@ -253,6 +256,17 @@ export function BankLogSearchForm({
     if (kindFilter === "deposit") return r.deposit > 0;
     if (kindFilter === "withdraw") return r.withdraw > 0;
     return true;
+  }).filter((r) => {
+    const q = searchQuery.trim().toLowerCase();
+    if (!q) return true;
+    const party = matches[r.transRemark];
+    return (
+      r.transRemark.toLowerCase().includes(q) ||
+      r.mgtRemark1.toLowerCase().includes(q) ||
+      r.mgtRemark2.toLowerCase().includes(q) ||
+      (party?.name?.toLowerCase().includes(q) ?? false) ||
+      (party?.code?.toLowerCase().includes(q) ?? false)
+    );
   });
   // 조회에 실제로 쓰인 기간 — 월 모드에서도 다운로드 파일명이 그 달을 그대로 보여주게 한다.
   const rangeLabel = mode === "month" ? month : `${startDate}_${endDate}`;
@@ -372,10 +386,11 @@ export function BankLogSearchForm({
     }
     if (confirmFilter !== "all") params.set("confirm", confirmFilter);
     if (kindFilter !== "all") params.set("kind", kindFilter);
+    if (searchQuery.trim()) params.set("q", searchQuery.trim());
     const qs = params.toString();
     if (window.location.search.replace(/^\?/, "") === qs) return;
     router.replace(`${pathname}?${qs}`, { scroll: false });
-  }, [accountNum, mode, month, startDate, endDate, confirmFilter, kindFilter, pathname, router]);
+  }, [accountNum, mode, month, startDate, endDate, confirmFilter, kindFilter, searchQuery, pathname, router]);
 
   function runSearch() {
     setError(null);
@@ -539,7 +554,7 @@ export function BankLogSearchForm({
               <span className="text-xs text-muted">
                 {rows.length}건 조회됨
                 {/* 필터를 걸면 지금 몇 건이 보이는지도 함께 알려준다. */}
-                {confirmFilter !== "all" && ` · 표시 ${sortedRows.length}건`}
+                {(confirmFilter !== "all" || searchQuery.trim()) && ` · 표시 ${sortedRows.length}건`}
               </span>
               {/* 확정/미확정 건수 + 미확정만 보기. 건수는 필터와 무관하게 조회 결과 전체 기준이다 —
                   필터를 걸면 숫자도 줄어들면 "몇 개 남았는지"를 알 수 없다. */}
@@ -568,6 +583,13 @@ export function BankLogSearchForm({
                   </button>
                 ))}
               </div>
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder="적요·거래처·비고 검색"
+                className="w-44 rounded-md border border-border bg-surface px-2 py-1 text-xs text-fg"
+              />
             </div>
             {/* 다운로드는 **화면에 보이는 것**을 내린다 — 미확정만 걸러 본 뒤 그걸 그대로 받는 게
                 자연스럽고, 필터와 파일 내용이 다르면 헷갈린다. 파일명에도 필터를 적는다. */}

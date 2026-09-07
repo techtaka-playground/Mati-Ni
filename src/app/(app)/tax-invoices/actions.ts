@@ -18,6 +18,8 @@ import { getAttachmentStatuses as getAttachmentStatusesLib, type AttachmentStatu
 import { saveTaxInvoiceRecords, getSavedTaxInvoiceRecords, mergeTaxInvoiceRows } from "@/lib/taxInvoiceRecords";
 import { assignTaxInvoiceNumbers } from "@/lib/taxInvoiceNumbers";
 import { ensurePartyByName, ensurePartiesFromTaxInvoiceRows } from "@/app/(app)/parties/actions";
+import { extractPurchaseStatementPdf } from "@/app/(app)/purchases/actions";
+import { isUnissuedLabel } from "@/lib/unissuedLabels";
 import { getAccessibleEmails } from "@/lib/email-groups";
 import { resolveCustomsPartyId } from "@/app/(app)/customs/actions";
 import { parseDateInput, formatDate, formatBizNo, bizNoDigits } from "@/lib/format";
@@ -432,7 +434,7 @@ export type TaxInvoiceEditHistoryEntry = {
 };
 
 export type EditApprovedTaxInvoiceResult =
-  | { ok: true; statuses: Record<string, AttachmentStatus> }
+  | { ok: true; statuses: Record<string, AttachmentStatus>; allocationReflect?: ReapplyAllocationsResult }
   | { ok: false; message: string };
 
 // 승인된 세금계산서의 B/L과 첨부파일을 고친다 — **사유가 반드시 있어야** 하고, 바뀔 때마다
@@ -443,6 +445,164 @@ export type EditApprovedTaxInvoiceResult =
 //
 // 실제 전표(Sale/Purchase/CustomsAdvance)의 B/L까지 함께 옮긴다 — 첨부의 B/L만 바꾸면
 // 화면에는 새 B/L이 보이는데 전표는 옛 B/L에 남아 매칭이 깨진다.
+// 매입 세금계산서 "수정" 팝업에서 인보이스를 다시 첨부했을 때, 그 안에서 다시 읽은 B/L·
+// 금액을 실제 PurchaseAllocation에도 반영한다(2026-09-07, "새로 업데이트하면 새로운 내용으로
+// 반영이 되어야지" 요청 — 예전엔 파일명만 바뀌고 배분은 그대로였다). 삭제는 하지 않는다 —
+// 같은 B/L 줄은 금액만 그 자리에서 고쳐 id를 그대로 두고(id가 바뀌면 이미 걸린 입출금
+// 배분(BankAllocation)이 끊긴다), 새 B/L만 새로 추가한다. 이미 확정된 배분이 하나라도
+// 있거나, 이 방식(삭제 없이 갱신+추가만)으로는 합계가 안 맞으면 아무것도 바꾸지 않는다 —
+// 잘못 건드리느니 그대로 두는 편이 안전하고, 그럴 땐 기존 안내대로 "묶음 풀기 → 다시 등록"을
+// 쓰면 된다.
+
+// 반영했는지, 왜 건너뛰었는지를 그대로 화면에 보여준다 — 조용히 넘어가면 사용자는 "저장은
+// 됐는데 왜 안 바뀌는지" 알 방법이 없다(2026-09-07, 실제로 그렇게 헷갈렸다).
+export type ReapplyAllocationsResult =
+  | { status: "applied"; updated: number; created: number }
+  | {
+      status: "skipped";
+      reason: string;
+      // 합계가 안 맞아서 건너뛴 경우에만 채운다 — 화면에서 "차액을 직접 입력"하는 입력칸을
+      // 띄울지 판단하는 데 쓴다(등록 팝업의 "미발행 줄"과 같은 개념, 2026-09-07 요청. 조정
+      // 줄이 2건 이상일 수 있다 — 같은 요청에서 "W/F 등 항목을 2개 이상 넣을 수 있게" 확장).
+      mismatch?: {
+        suggestedAmount: number; // newBlTotal과 매입 총액의 차이 — 조정 줄 합계에 넣으면 딱 맞는 값
+        existingAdjustments: { label: string; amount: number }[]; // 기존 조정 줄 전부(없으면 빈 배열)
+      };
+    };
+
+async function reapplyPurchaseAllocationsFromFile(
+  ntsSendKey: string,
+  fileBase64: string,
+  manualAdjustments?: { label: string; amount: number }[] | null
+): Promise<ReapplyAllocationsResult> {
+  const purchase = await prisma.purchase.findFirst({ where: { ntsSendKey } });
+  if (!purchase) return { status: "skipped", reason: "이 승인번호로 등록된 매입 전표를 찾지 못했습니다." };
+
+  const allocations = await prisma.purchaseAllocation.findMany({ where: { purchaseId: purchase.id } });
+  if (allocations.some((a) => a.settlementConfirmedAt)) {
+    return { status: "skipped", reason: "이미 확정된 배분이 있어 반영하지 않았습니다." };
+  }
+
+  const extracted = await extractPurchaseStatementPdf(fileBase64);
+  if (!extracted.ok) {
+    return { status: "skipped", reason: `새 파일에서 B/L·금액을 읽지 못해 반영하지 않았습니다 (${extracted.message}).` };
+  }
+  const newLines = extracted.data.lines
+    .map((l) => ({ blNo: l.refNo.trim(), amount: l.supplyAmount ?? l.amount }))
+    .filter((l) => l.blNo);
+  if (newLines.length === 0) {
+    return { status: "skipped", reason: "새 파일에서 B/L별 줄을 찾지 못해 반영하지 않았습니다." };
+  }
+
+  // 미발행(조정) 줄은 보통 blNo가 빈 문자열이지만, 예전 등록 경로로 들어온 일부 데이터는
+  // label 대신 blNo 칸에 "W/F" 같은 사유 문구가 그대로 들어있다(실제로 발견됨) — 그런 줄도
+  // 진짜 B/L처럼 대응시키려다 못 찾아서 매번 반영이 통째로 막히면 안 되니 같이 걸러낸다.
+  const isRealBlNo = (blNo: string) => Boolean(blNo) && !isUnissuedLabel(blNo);
+  const adjustmentRows = allocations.filter((a) => !isRealBlNo(a.blNo));
+  const blRows = allocations.filter((a) => isRealBlNo(a.blNo));
+  const blRowsByBlNo = new Map<string, typeof blRows>();
+  for (const a of blRows) blRowsByBlNo.set(a.blNo, [...(blRowsByBlNo.get(a.blNo) ?? []), a]);
+
+  // 같은 B/L끼리 순서대로 짝짓는다(같은 B/L이 여러 줄일 수 있어서). 기존 줄은 금액만
+  // 갱신하고, 그 B/L에 남는 새 줄은 새로 만든다.
+  const updates: { id: string; amount: number }[] = [];
+  const creates: { blNo: string; amount: number }[] = [];
+  const consumed = new Set<string>();
+  for (const line of newLines) {
+    const target = (blRowsByBlNo.get(line.blNo) ?? []).find((a) => !consumed.has(a.id));
+    if (target) {
+      consumed.add(target.id);
+      updates.push({ id: target.id, amount: line.amount });
+    } else {
+      creates.push({ blNo: line.blNo, amount: line.amount });
+    }
+  }
+  // 기존 줄 중 새 파일에서 짝을 못 찾은 게 남으면(줄이 통째로 없어진 경우) 삭제 없이는
+  // 반영할 수 없으므로 전체를 포기한다.
+  const leftover = blRows.filter((a) => !consumed.has(a.id));
+  if (leftover.length > 0) {
+    return {
+      status: "skipped",
+      reason: `기존 배분 중 새 파일에 없는 B/L이 있어(${leftover.map((a) => a.blNo).join(", ")}) 반영하지 않았습니다 — 줄을 지우려면 "묶음 풀기 → 다시 등록"을 쓰세요.`,
+    };
+  }
+
+  const newBlTotal = updates.reduce((sum, u) => sum + u.amount, 0) + creates.reduce((sum, c) => sum + c.amount, 0);
+  const existingAdjustmentSum = adjustmentRows.reduce((sum, a) => sum + a.amount, 0);
+
+  // 사용자가 직접 차액(조정 줄들) 금액을 넣었으면 그 합계를 쓰고, 안 넣었으면 기존 조정 줄
+  // 합계를 그대로 쓴다(지금까지의 자동 반영과 같은 동작).
+  const adjustmentSum = manualAdjustments ? manualAdjustments.reduce((sum, a) => sum + a.amount, 0) : existingAdjustmentSum;
+  if (Math.round(newBlTotal + adjustmentSum) !== Math.round(purchase.amount)) {
+    return {
+      status: "skipped",
+      reason: `새 파일 기준 합계(${Math.round(newBlTotal + adjustmentSum).toLocaleString()}원)가 기존 매입 총액(${Math.round(purchase.amount).toLocaleString()}원)과 달라 반영하지 않았습니다.`,
+      mismatch: {
+        suggestedAmount: Math.round(purchase.amount - newBlTotal),
+        existingAdjustments: adjustmentRows.map((a) => ({ label: a.label || a.blNo, amount: a.amount })),
+      },
+    };
+  }
+
+  // 조정 줄들을 새 값으로 반영한다 — 사용자가 차액을 입력했을 때만. 기존 조정 줄과 순서대로
+  // 짝지어 그 자리에서 금액·명칭만 고치고(id를 그대로 둬야 이미 걸린 입출금 배분이 안
+  // 끊긴다), 새로 늘어난 만큼만 추가한다. **줄이던 것을 줄이려면**(기존 조정 줄이 새로
+  // 입력한 것보다 많으면) 삭제 없이는 반영할 수 없으므로 전체를 포기한다 — B/L 줄이 없어진
+  // 경우와 같은 규칙이다.
+  const adjustmentUpdates: { id: string; label: string; amount: number }[] = [];
+  const adjustmentCreates: { label: string; amount: number }[] = [];
+  if (manualAdjustments) {
+    if (adjustmentRows.length > manualAdjustments.length) {
+      return {
+        status: "skipped",
+        reason: "조정 줄을 지금보다 줄일 수는 없습니다(삭제 없이는 반영할 수 없습니다) — 그대로 두거나 늘려서 다시 시도하세요.",
+      };
+    }
+    manualAdjustments.forEach((a, i) => {
+      const existing = adjustmentRows[i];
+      if (existing) adjustmentUpdates.push({ id: existing.id, label: a.label, amount: a.amount });
+      else adjustmentCreates.push({ label: a.label, amount: a.amount });
+    });
+  }
+
+  const blNos = [...new Set(creates.map((c) => c.blNo))];
+  const sales = blNos.length
+    ? await prisma.sale.findMany({ where: { blNo: { in: blNos } }, select: { id: true, blNo: true } })
+    : [];
+  const saleIdByBlNo = new Map(sales.map((s) => [s.blNo, s.id]));
+
+  await prisma.$transaction(async (tx) => {
+    for (const u of updates) {
+      await tx.purchaseAllocation.update({ where: { id: u.id }, data: { amount: u.amount } });
+    }
+    for (const c of creates) {
+      await tx.purchaseAllocation.create({
+        data: {
+          purchaseId: purchase.id,
+          blNo: c.blNo,
+          amount: c.amount,
+          saleId: saleIdByBlNo.get(c.blNo) ?? null,
+          label: "",
+        },
+      });
+    }
+    for (const u of adjustmentUpdates) {
+      await tx.purchaseAllocation.update({ where: { id: u.id }, data: { label: u.label, amount: u.amount } });
+    }
+    for (const c of adjustmentCreates) {
+      await tx.purchaseAllocation.create({
+        data: { purchaseId: purchase.id, saleId: null, blNo: "", label: c.label, amount: c.amount },
+      });
+    }
+  });
+
+  return {
+    status: "applied",
+    updated: updates.length + adjustmentUpdates.length,
+    created: creates.length + adjustmentCreates.length,
+  };
+}
+
 export async function editApprovedTaxInvoice(input: {
   ntsSendKeys: string[];
   direction: TaxInvoiceDirection;
@@ -450,6 +610,10 @@ export async function editApprovedTaxInvoice(input: {
   newBlNo: string;
   reason: string;
   file?: { base64: string; originalName: string } | null;
+  // 새로 첨부한 파일 기준 합계가 기존 매입 총액과 안 맞을 때, 그 차액을 사용자가 직접
+  // 조정 줄(들)로 지정한 값(등록 팝업의 "미발행 줄"과 같은 개념, 2026-09-07 — W/F 등 조정
+  // 줄을 2건 이상 넣을 수 있어야 한다는 요청에 따라 배열로 받는다).
+  manualAdjustments?: { label: string; amount: number }[] | null;
 }): Promise<EditApprovedTaxInvoiceResult> {
   const user = await getTaxInvoiceUser();
   if (!user) return { ok: false, message: "세금계산서 열람 권한이 없습니다." };
@@ -471,6 +635,7 @@ export async function editApprovedTaxInvoice(input: {
 
   // 파일을 새로 올렸으면 저장한다(선택) — 안 올리면 기존 파일명을 그대로 유지한다.
   let newFileName = primary.fileName;
+  let allocationReflect: ReapplyAllocationsResult | undefined;
   if (input.file) {
     const saved =
       input.ntsSendKeys.length > 1
@@ -488,23 +653,67 @@ export async function editApprovedTaxInvoice(input: {
           });
     if (!saved.ok) return { ok: false, message: saved.message };
     newFileName = saved.filename;
+
+    // 재발행 인보이스를 다시 첨부했으면 그 안의 B/L·금액도 배분에 반영해본다(매입만 —
+    // 매출은 B/L마다 별도 Sale 행이라 구조가 달라 범위 밖이다). 반영했는지 건너뛰었는지는
+    // 결과에 그대로 담아 화면에 보여준다 — 조용히 넘어가면 사용자가 이유를 알 수 없다.
+    if (input.direction === "purchase" && input.ntsSendKeys.length === 1) {
+      allocationReflect = await reapplyPurchaseAllocationsFromFile(
+        input.ntsSendKeys[0],
+        input.file.base64,
+        input.manualAdjustments
+      );
+    }
   }
 
   const nothingChanged = newBlNo === oldBlNo && newFileName === primary.fileName;
   if (nothingChanged) return { ok: false, message: "변경된 내용이 없습니다." };
 
-  // 전표 쪽 B/L도 함께 옮긴다(B/L이 바뀐 경우에만).
-  if (oldBlNo && newBlNo !== oldBlNo) {
+  // 전표 쪽 B/L도 함께 옮긴다(B/L이 바뀐 경우에만) — **oldBlNo(첨부에 저장된 B/L) 텍스트가
+  // 아니라 승인번호로 전표를 직접 찾는다.** 예전엔 oldBlNo로 Sale/PurchaseAllocation을
+  // 찾았는데, 인보이스 인식 실패 등으로 첨부의 B/L이 비어있거나 실제 전표의 B/L과 다른 건이
+  // 있어서(taxInvoiceAttachments.ts의 "O00010" 사례 참고) 그때는 `if (oldBlNo && ...)`에
+  // 걸려 아예 건너뛰거나, oldBlNo가 빈 문자열이면 W/F 같은 엉뚱한 배분(blNo도 "")을 잘못
+  // 찾아 고칠 위험이 있었다 — 승인번호는 항상 정확하므로 그걸로 찾는 게 안전하다(2026-09-07,
+  // "수정했는데 반영이 안 된다" 버그).
+  if (newBlNo !== oldBlNo) {
     if (input.direction === "sales") {
-      const sale = await prisma.sale.findFirst({ where: { blNo: oldBlNo, ntsSendKey: { not: null } } });
+      const sale = await prisma.sale.findFirst({ where: { ntsSendKey: input.ntsSendKeys[0] } });
       if (sale) {
         await prisma.sale.update({ where: { id: sale.id }, data: { blNo: newBlNo } });
         await prisma.purchaseAllocation.updateMany({ where: { blNo: newBlNo, saleId: null }, data: { saleId: sale.id } });
         await prisma.customsAdvance.updateMany({ where: { blNo: newBlNo, saleId: null }, data: { saleId: sale.id } });
       }
     } else {
-      await prisma.purchaseAllocation.updateMany({ where: { blNo: oldBlNo }, data: { blNo: newBlNo } });
-      await prisma.customsAdvance.updateMany({ where: { blNo: oldBlNo }, data: { blNo: newBlNo } });
+      const purchase = await prisma.purchase.findFirst({ where: { ntsSendKey: input.ntsSendKeys[0] } });
+      if (purchase) {
+        const allocations = await prisma.purchaseAllocation.findMany({ where: { purchaseId: purchase.id } });
+        const realBlNos = new Set(
+          allocations.map((a) => a.blNo).filter((b) => b && !isUnissuedLabel(b))
+        );
+        // B/L이 여러 건으로 나뉜 매입(다건 명세서)은 이 칸(새 B/L, 텍스트 하나)으로 "그
+        // 대표 B/L 텍스트를 쓰는 배분 전부"를 바꾸면 위험하다 — 대표 B/L은 순서가 안정된
+        // 값일 뿐 사용자가 지금 실제로 고치려는 그 줄이라는 보장이 없어서, 잘못하면 서로
+        // 다른 B/L의 배분들이 통째로 엉뚱한 값으로 덮어써진다(실제로 그래서 이 매입의 B/L
+        // 두 줄이 전부 다른 B/L 텍스트로 바뀐 사고가 있었다, 2026-09-07). 그래서 진짜 B/L이
+        // 정확히 하나뿐인 매입에만 이 자동 반영을 적용하고, 여러 건이면 첨부의 표시용
+        // 대표 B/L만 바꾸고 배분 자체는 손대지 않는다 — 특정 줄의 B/L을 고치려면 "인보이스
+        // 다시 첨부"로 다시 인식시키거나 "묶음 풀기 → 다시 등록"을 쓴다.
+        if (realBlNos.size <= 1) {
+          const matching = oldBlNo ? allocations.filter((a) => a.blNo === oldBlNo) : [];
+          const targets = matching.length > 0 ? matching : allocations.length === 1 ? allocations : [];
+          if (targets.length > 0) {
+            await prisma.purchaseAllocation.updateMany({
+              where: { id: { in: targets.map((t) => t.id) } },
+              data: { blNo: newBlNo },
+            });
+          }
+        }
+      }
+      const customsAdvance = await prisma.customsAdvance.findFirst({ where: { ntsSendKey: input.ntsSendKeys[0] } });
+      if (customsAdvance) {
+        await prisma.customsAdvance.update({ where: { id: customsAdvance.id }, data: { blNo: newBlNo } });
+      }
     }
   }
 
@@ -534,7 +743,7 @@ export async function editApprovedTaxInvoice(input: {
   const statuses = await getAttachmentStatusesLib(
     input.ntsSendKeys.map((ntsSendKey) => ({ ntsSendKey, direction: input.direction }))
   );
-  return { ok: true, statuses };
+  return { ok: true, statuses, allocationReflect };
 }
 
 export async function getTaxInvoiceEditHistory(
@@ -725,12 +934,22 @@ export async function getRegistrationDetail(input: {
     };
   }
 
-  const alloc = await prisma.purchaseAllocation.findFirst({
-    where: { blNo },
-    include: { purchase: { include: { party: true, allocations: true } } },
+  // 이 승인번호로 직접 등록된 매입 — 위 매출 분기와 같은 이유로 ntsSendKey를 먼저 찾는다.
+  // blNo만으로 찾으면(예전 방식) 같은 B/L 번호를 쓰는 매입이 여러 건 있을 때(예: 큰 화물을
+  // 나눠서 여러 번 매입 등록한 경우) findFirst가 어느 걸 고를지 보장이 없어 완전히 무관한
+  // 매입의 금액이 뜨는 사고가 났다(2026-09-07, 예일해운항공 건에서 홀마트 매입이 대신 뜸).
+  let p = await prisma.purchase.findFirst({
+    where: { ntsSendKey: input.ntsSendKey },
+    include: { party: true, allocations: true },
   });
-  if (alloc) {
-    const p = alloc.purchase;
+  if (!p) {
+    const alloc = await prisma.purchaseAllocation.findFirst({
+      where: { blNo },
+      include: { purchase: { include: { party: true, allocations: true } } },
+    });
+    p = alloc?.purchase ?? null;
+  }
+  if (p) {
     return {
       ok: true,
       detail: {

@@ -2,7 +2,7 @@
 
 import { Fragment, useEffect, useState, useTransition } from "react";
 import { updateSale, deleteSale } from "@/app/(app)/sales/actions";
-import { updatePurchase, deletePurchase } from "@/app/(app)/purchases/actions";
+import { updatePurchase, deletePurchase, deletePurchaseAllocationLine } from "@/app/(app)/purchases/actions";
 import {
   confirmVoucher,
   unconfirmVoucher,
@@ -20,7 +20,7 @@ import { commaInput, numOf, formatAmount, formatDate } from "@/lib/format";
 import { DeleteButton } from "@/components/DeleteButton";
 import { SortableTh } from "@/components/SortableTh";
 import { sortGroupedRowsBy, toggleSort, type SortState, type SortValue } from "@/lib/tableSort";
-import { IconPlus, IconMinus, IconTreeConnector, IconCheckCircle } from "@/components/icons";
+import { IconPlus, IconMinus, IconTreeConnector, IconCheckCircle, IconAlertCircle } from "@/components/icons";
 import type { AllocationDetail, FxAdjustmentDetail, MatchCandidate } from "@/lib/bankAllocation";
 
 export type VoucherRow = {
@@ -159,12 +159,32 @@ export function VoucherTable({
   const [error, setError] = useState<string | null>(null);
   const [pending, startTransition] = useTransition();
   const [sort, setSort] = useState<SortState<VoucherSortKey>>(null);
+  // 자유 검색 — 거래처·B/L·비고·세금계산서 관리번호를 대상으로 한다(2026-09-07). 이 화면은
+  // 조회기간이 바뀔 때마다 서버(page.tsx)가 다시 조회하는 구조라, bank/세금계산서 화면과 달리
+  // 검색어는 URL에 남기지 않는다(남기면 한 글자 칠 때마다 서버 재조회가 걸린다) — 탭을
+  // 옮기면 초기화된다. 전표 단위(entry)로 필터한다 — 줄(subRow) 단위로 거르면 수정·삭제
+  // 버튼이 있는 첫 줄(blIndex===0)만 사라지고 나머지 줄이 남는 식으로 깨질 수 있어서, 검색어에
+  // 맞는 줄이 하나라도 있으면 그 전표의 모든 줄을 같이 보여준다.
+  const [searchQuery, setSearchQuery] = useState("");
   // 같은 세금계산서(승인번호)에서 여러 전표로 나뉜 건들을 펼쳐서 볼지 — 세금계산서 화면의
   // "N건 묶음"과 같은 방식이다(2026-08-27).
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
   // "확정"(1단계→2단계) 확인 팝업 — 어느 줄을 확정하려는지만 들고 있는다.
   const [confirmingRow, setConfirmingRow] = useState<VoucherRow | null>(null);
   const [confirmPending, startConfirmTransition] = useTransition();
+  // 묶음 전체를 한 번에 확정하는 팝업 — 배분이 100% 안 끝난 줄은 건너뛰고, 몇 건을
+  // 확정했는지 결과를 보여준다(2026-09-07, "전체 확정" 요청).
+  const [confirmingBundle, setConfirmingBundle] = useState<{ taxInvoiceNo: string; rows: VoucherRow[] } | null>(null);
+  const [bundleConfirmPending, startBundleConfirmTransition] = useTransition();
+  const [bundleConfirmResult, setBundleConfirmResult] = useState<string | null>(null);
+  // 묶음 전체(서로 다른 전표 여러 건 포함)를 한 번에 지우는 팝업 — "전체 확정" 옆에 나란히
+  // 두 요청(2026-09-07). 확정된 B/L이 하나라도 있는 전표는 deletePurchase/deleteSale이
+  // 자체적으로 거부하므로(reason: "confirmed") 여기서도 그대로 시도만 하고 결과를 센다.
+  const [confirmingBundleDelete, setConfirmingBundleDelete] = useState<{ taxInvoiceNo: string; entries: Entry[] } | null>(
+    null
+  );
+  const [bundleDeletePending, startBundleDeleteTransition] = useTransition();
+  const [bundleDeleteResult, setBundleDeleteResult] = useState<string | null>(null);
   // "확정 해제" 팝업 — 사유가 필수라 DeleteButton과 달리 별도 상태로 관리한다. mode가
   // "direct"면 관리자가 바로 해제하고, "request"면 관리자가 아닌 사용자가 사유를 남겨
   // 해제를 요청만 한다(2026-08-31).
@@ -221,7 +241,7 @@ export function VoucherTable({
 
   // 정렬된 줄들을 다시 전표(entry) 단위로 묶는다 — blIndex 줄들은 항상 붙어 있으므로 순서대로
   // 훑으며 key가 바뀔 때만 새 entry를 만들면 된다.
-  const entries: Entry[] = [];
+  const allEntries: Entry[] = [];
   const entryByKey = new Map<string, Entry>();
   for (const r of sortedRows) {
     const key = `${r.kind}-${r.id}`;
@@ -229,10 +249,25 @@ export function VoucherTable({
     if (!e) {
       e = { key, kind: r.kind, id: r.id, subRows: [] };
       entryByKey.set(key, e);
-      entries.push(e);
+      allEntries.push(e);
     }
     e.subRows.push(r);
   }
+
+  const searchNeedle = searchQuery.trim().toLowerCase();
+  const entries = !searchNeedle
+    ? allEntries
+    : allEntries.filter((e) =>
+        e.subRows.some(
+          (r) =>
+            r.partyName.toLowerCase().includes(searchNeedle) ||
+            (r.partyCode?.toLowerCase().includes(searchNeedle) ?? false) ||
+            r.blNo.toLowerCase().includes(searchNeedle) ||
+            r.allocLabel.toLowerCase().includes(searchNeedle) ||
+            (r.taxInvoiceNo?.toLowerCase().includes(searchNeedle) ?? false) ||
+            r.note.toLowerCase().includes(searchNeedle)
+        )
+      );
 
   // 같은 세금계산서(taxInvoiceNo)에서 나온 전표가 둘 이상이면 묶음 후보다 — 세금계산서 1건을
   // 여러 B/L로 나눠 등록하면(매출) 또는 여러 세금계산서를 묶어 등록하면(매입) 서로 다른
@@ -300,6 +335,53 @@ export function VoucherTable({
     startConfirmTransition(async () => {
       await confirmVoucher(voucherKindOf(r), r.settleId);
       setConfirmingRow(null);
+    });
+  }
+
+  // 묶음 안에서 아직 확정 안 됐고(settlementConfirmedAt 없음) 100% 배분이 끝난(fullyAllocated)
+  // 줄만 골라 순서대로 확정한다 — 개별 "확정" 버튼과 같은 조건이다. 실패한 줄은 세어뒀다가
+  // 결과 메시지로 알려준다(개별 확정도 지금까지 실패를 화면에 안 보여줬는데, 여러 건을 한
+  // 번에 돌리면 조용히 몇 건이 빠졌는지 모르는 채로 넘어가면 안 된다).
+  function handleConfirmBundle() {
+    if (!confirmingBundle) return;
+    const targets = confirmingBundle.rows.filter((r) => r.fullyAllocated && !r.settlementConfirmedAt);
+    startBundleConfirmTransition(async () => {
+      let succeeded = 0;
+      let failed = 0;
+      for (const r of targets) {
+        const result = await confirmVoucher(voucherKindOf(r), r.settleId);
+        if (result.ok) succeeded++;
+        else failed++;
+      }
+      setConfirmingBundle(null);
+      setBundleConfirmResult(
+        failed > 0 ? `${succeeded}건 확정, ${failed}건 실패했습니다.` : `${succeeded}건 확정했습니다.`
+      );
+    });
+  }
+
+  // 묶음에 포함된 전표(entry)를 하나씩 지운다 — entry 단위 삭제라 확정된 B/L이 하나라도 있는
+  // 전표는 서버에서 거부되므로(reason: "confirmed") 그런 전표는 실패로 세어질 뿐 나머지는
+  // 그대로 진행된다.
+  function handleDeleteBundle() {
+    if (!confirmingBundleDelete) return;
+    const targets = confirmingBundleDelete.entries;
+    startBundleDeleteTransition(async () => {
+      let succeeded = 0;
+      let failed = 0;
+      for (const e of targets) {
+        const fd = new FormData();
+        fd.set("id", e.id);
+        const result = e.kind === "sale" ? await deleteSale(fd) : await deletePurchase(fd);
+        if (result.ok) succeeded++;
+        else failed++;
+      }
+      setConfirmingBundleDelete(null);
+      setBundleDeleteResult(
+        failed > 0
+          ? `${succeeded}건 삭제, ${failed}건 실패했습니다(확정된 건은 관리자 해제 후 다시 시도하세요).`
+          : `${succeeded}건 삭제했습니다.`
+      );
     });
   }
 
@@ -769,10 +851,27 @@ export function VoucherTable({
                       확정
                     </button>
                   )}
+                  {/* 이 B/L 한 줄만 지운다 — 묶음(B/L이 여러 건인 매입)에서만 의미가 있다.
+                      전체 삭제(아래)와 달리 나머지 줄·전표 자체는 그대로 남는다(2026-09-07,
+                      "부분삭제" 요청). 모든 줄(blIndex 상관없이)에 둔다 — 어느 줄이든 그 줄만
+                      골라 지울 수 있어야 한다. */}
+                  {r.kind === "purchase" && r.blCount > 1 && !r.settlementConfirmedAt && (
+                    <DeleteButton
+                      action={deletePurchaseAllocationLine}
+                      id={r.settleId}
+                      label="삭제"
+                      confirmMessage={`B/L "${r.blNo || r.allocLabel}" 배분 한 줄(${formatAmount(r.amount)}원)만 삭제할까요? 나머지 ${r.blCount - 1}줄은 그대로 남습니다.`}
+                      reasonMessages={{
+                        confirmed: "확정된 줄은 관리자가 해제하기 전까지 삭제할 수 없습니다.",
+                        last_line: "마지막 남은 줄입니다 — 전체 삭제를 사용하세요.",
+                      }}
+                    />
+                  )}
                   {r.blIndex === 0 && (
                     <DeleteButton
                       action={r.kind === "sale" ? deleteSale : deletePurchase}
                       id={r.id}
+                      label={r.blCount > 1 ? "전체 삭제" : "삭제"}
                       confirmMessage={
                         r.kind === "sale"
                           ? `B/L "${r.blNo}" 매출을 삭제할까요? 연결된 매입배분·관세대납 기록도 함께 삭제됩니다.`
@@ -861,7 +960,34 @@ export function VoucherTable({
           <td className={`py-2 pr-3 text-right num text-muted ${SETTLE_COL}`}>-</td>
           <td className="py-2 pr-3" />
           <td className={`py-2 pr-3 text-muted ${GROUP}`}>{first.note}</td>
-          <td className="py-2 pr-2" />
+          <td className="py-2 pr-2 text-right whitespace-nowrap">
+            {/* 묶음 안에서 아직 확정 안 됐고 100% 배분이 끝난 줄이 하나라도 있으면 보여준다 —
+                펼치지 않고도 한 번에 확정할 수 있게(2026-09-07, "전체 확정" 요청). */}
+            {members.some((e) => e.subRows.some((r) => r.fullyAllocated && !r.settlementConfirmedAt)) && (
+              <button
+                type="button"
+                onClick={() =>
+                  setConfirmingBundle({
+                    taxInvoiceNo,
+                    rows: members.flatMap((e) => e.subRows),
+                  })
+                }
+                className="mr-2 text-xs text-accent hover:underline"
+              >
+                전체 확정
+              </button>
+            )}
+            {/* 이 묶음에 포함된 전표(entry, 서로 다른 매입/매출일 수 있다)를 전부 지운다 —
+                "전체 확정" 옆에 나란히 둔다(2026-09-07 요청). 확정된 B/L이 하나라도 있는
+                전표는 삭제 액션이 자체적으로 거부한다. */}
+            <button
+              type="button"
+              onClick={() => setConfirmingBundleDelete({ taxInvoiceNo, entries: members })}
+              className="text-xs text-neg hover:underline"
+            >
+              전체 삭제
+            </button>
+          </td>
         </tr>
         {isExpanded &&
           members.flatMap((entry, mi) =>
@@ -904,6 +1030,19 @@ export function VoucherTable({
 
   return (
     <>
+    <div className="mb-3 flex items-center justify-between gap-3">
+      <span className="text-xs text-muted">
+        {allEntries.length}건 조회됨
+        {searchNeedle && ` · 표시 ${entries.length}건`}
+      </span>
+      <input
+        type="text"
+        value={searchQuery}
+        onChange={(e) => setSearchQuery(e.target.value)}
+        placeholder="거래처·B/L·비고·관리번호 검색"
+        className="w-52 rounded-md border border-border bg-surface px-2 py-1 text-xs text-fg"
+      />
+    </div>
     <table className="w-full min-w-[1040px] text-sm">
       <thead>
         <tr className="border-b border-border text-left text-xs text-muted">
@@ -978,6 +1117,109 @@ export function VoucherTable({
               {confirmPending ? "확정 중..." : "확정"}
             </button>
           </div>
+        </div>
+      </div>
+    )}
+
+    {/* "전체 확정" 확인 팝업 — 개별 확정 팝업과 같은 톤이다. */}
+    {confirmingBundle && (
+      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+        <div className="card flex w-full max-w-sm flex-col items-center gap-5 p-7 text-center">
+          <span className="flex h-11 w-11 items-center justify-center rounded-full bg-accent-soft text-accent">
+            <IconCheckCircle className="h-6 w-6" />
+          </span>
+          <p className="w-full text-base leading-relaxed text-fg">
+            이 묶음의 미확정 {confirmingBundle.rows.filter((r) => r.fullyAllocated && !r.settlementConfirmedAt).length}
+            건을 모두 확정할까요? 확정 후에는 관리자가 해제하기 전까지 수정·삭제할 수 없습니다.
+          </p>
+          <div className="flex w-full justify-center gap-3">
+            <button
+              type="button"
+              onClick={() => setConfirmingBundle(null)}
+              className="flex-1 rounded-xl border border-border px-5 py-2.5 text-base text-muted hover:bg-gray-95 hover:text-fg"
+            >
+              취소
+            </button>
+            <button
+              type="button"
+              disabled={bundleConfirmPending}
+              onClick={handleConfirmBundle}
+              className="flex-1 rounded-xl bg-accent px-6 py-2.5 text-base font-medium text-accent-fg hover:bg-accent-hover disabled:opacity-50"
+            >
+              {bundleConfirmPending ? "확정 중..." : "전체 확정"}
+            </button>
+          </div>
+        </div>
+      </div>
+    )}
+
+    {bundleConfirmResult && (
+      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+        <div className="card flex w-full max-w-sm flex-col items-center gap-5 p-7 text-center">
+          <span className="flex h-11 w-11 items-center justify-center rounded-full bg-accent-soft text-accent">
+            <IconCheckCircle className="h-6 w-6" />
+          </span>
+          <p className="w-full text-base leading-relaxed text-fg">{bundleConfirmResult}</p>
+          <button
+            type="button"
+            onClick={() => setBundleConfirmResult(null)}
+            className="w-full rounded-xl bg-accent px-6 py-2.5 text-base font-medium text-accent-fg hover:bg-accent-hover"
+          >
+            확인
+          </button>
+        </div>
+      </div>
+    )}
+
+    {/* "전체 삭제"(묶음) 확인 팝업 — DeleteButton과 같은 톤(빨강)이다. 이 묶음에 서로 다른
+        전표가 여러 건 있을 수 있어 몇 건이 지워지는지 미리 보여준다. */}
+    {confirmingBundleDelete && (
+      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+        <div className="card flex w-full max-w-sm flex-col items-center gap-5 p-8 text-center">
+          <span className="flex h-12 w-12 items-center justify-center rounded-full bg-neg/10 text-neg">
+            <IconAlertCircle className="h-6 w-6" />
+          </span>
+          <p className="w-full text-base leading-relaxed text-fg">
+            이 묶음의 전표 {confirmingBundleDelete.entries.length}건(
+            {confirmingBundleDelete.entries.reduce((sum, e) => sum + e.subRows.length, 0)}줄)을 모두 삭제할까요?
+            <br />
+            <span className="text-sm text-muted">확정된 B/L이 있는 전표는 삭제되지 않습니다.</span>
+          </p>
+          <div className="flex w-full justify-center gap-3">
+            <button
+              type="button"
+              onClick={() => setConfirmingBundleDelete(null)}
+              className="flex-1 rounded-xl border border-border px-5 py-2.5 text-sm font-medium text-muted hover:bg-gray-95 hover:text-fg"
+            >
+              취소
+            </button>
+            <button
+              type="button"
+              disabled={bundleDeletePending}
+              onClick={handleDeleteBundle}
+              className="flex-1 rounded-xl bg-neg px-6 py-2.5 text-sm font-medium text-white hover:opacity-90 disabled:opacity-50"
+            >
+              {bundleDeletePending ? "삭제 중..." : "전체 삭제"}
+            </button>
+          </div>
+        </div>
+      </div>
+    )}
+
+    {bundleDeleteResult && (
+      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+        <div className="card flex w-full max-w-sm flex-col items-center gap-5 p-7 text-center">
+          <span className="flex h-11 w-11 items-center justify-center rounded-full bg-neg/10 text-neg">
+            <IconAlertCircle className="h-6 w-6" />
+          </span>
+          <p className="w-full text-base leading-relaxed text-fg">{bundleDeleteResult}</p>
+          <button
+            type="button"
+            onClick={() => setBundleDeleteResult(null)}
+            className="w-full rounded-xl bg-accent px-6 py-2.5 text-base font-medium text-accent-fg hover:bg-accent-hover"
+          >
+            확인
+          </button>
         </div>
       </div>
     )}

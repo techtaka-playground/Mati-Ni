@@ -137,6 +137,10 @@ export function CustomsTable({
   isAdmin: boolean;
 }) {
   const [sort, setSort] = useState<SortState<CustomsSortKey>>(null);
+  // 자유 검색 — B/L·거래처·지급처·비고를 대상으로 한다(2026-09-07). 이 화면은 조회기간이
+  // 바뀔 때마다 서버(page.tsx)가 다시 조회하는 구조라, bank/세금계산서 화면과 달리 검색어는
+  // URL에 남기지 않는다(남기면 한 글자 칠 때마다 서버 재조회가 걸린다) — 탭을 옮기면 초기화된다.
+  const [searchQuery, setSearchQuery] = useState("");
   // 지금 지급처를 고치고 있는 행(한 번에 한 줄만) — 목록엔 없던 지급처를 나중에 채우거나
   // 잘못 붙은 것을 바꿀 때 쓴다. 삭제 후 재등록하면 회수 기록·B/L 연결이 같이 사라지므로
   // 이 값만 따로 고칠 수 있게 했다.
@@ -332,11 +336,35 @@ export function CustomsTable({
   }
 
   // 회수 세부 줄은 대표 줄 바로 아래에 렌더되므로(펼침 상태), 대표 줄만 정렬하면 자동으로 따라온다.
-  const sortedRows = sortRowsBy(rows, sort, customsSortValue);
+  const sortedRows = sortRowsBy(rows, sort, customsSortValue).filter((r) => {
+    const q = searchQuery.trim().toLowerCase();
+    if (!q) return true;
+    return (
+      r.blNo.toLowerCase().includes(q) ||
+      (r.partyName?.toLowerCase().includes(q) ?? false) ||
+      (r.partyCode?.toLowerCase().includes(q) ?? false) ||
+      (r.payeePartyName?.toLowerCase().includes(q) ?? false) ||
+      (r.payeePartyCode?.toLowerCase().includes(q) ?? false) ||
+      r.note.toLowerCase().includes(q)
+    );
+  });
 
   return (
     <>
     <div className="card overflow-x-auto p-4">
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <span className="text-xs text-muted">
+          {rows.length}건 조회됨
+          {searchQuery.trim() && ` · 표시 ${sortedRows.length}건`}
+        </span>
+        <input
+          type="text"
+          value={searchQuery}
+          onChange={(e) => setSearchQuery(e.target.value)}
+          placeholder="B/L·거래처·지급처·비고 검색"
+          className="w-52 rounded-md border border-border bg-surface px-2 py-1 text-xs text-fg"
+        />
+      </div>
       <table className="w-full text-sm">
         <thead>
           <tr className="border-b border-border text-left text-xs text-muted">

@@ -262,3 +262,34 @@ export async function deletePurchase(formData: FormData): Promise<DeleteActionRe
   revalidatePath("/tax-invoices");
   return { ok: true };
 }
+
+// 묶음 매입(여러 B/L로 나뉜 배분) 중 한 줄만 지운다 — 전체 삭제(deletePurchase)와 달리 나머지
+// 줄은 그대로 둔다(2026-09-07, "부분삭제" 요청). 매입 총액(Purchase.amount)은 항상 배분
+// 합계와 같아야 하므로 삭제한 만큼 같이 줄인다 — 안 그러면 손익(매출-배분매입)이 어긋난다.
+export async function deletePurchaseAllocationLine(formData: FormData): Promise<DeleteActionResult> {
+  await requireLoggedIn();
+  const id = String(formData.get("id") ?? "");
+  if (!id) return { ok: false, reason: "not_found" };
+
+  const allocation = await prisma.purchaseAllocation.findUnique({ where: { id } });
+  if (!allocation) return { ok: false, reason: "not_found" };
+  if (allocation.settlementConfirmedAt) return { ok: false, reason: "confirmed" };
+
+  const siblingCount = await prisma.purchaseAllocation.count({ where: { purchaseId: allocation.purchaseId } });
+  // 마지막 한 줄까지 이 방식으로 지우면 배분이 하나도 없는 매입 전표가 남는다 — 그건 전체
+  // 삭제(deletePurchase)로 지우게 한다.
+  if (siblingCount <= 1) return { ok: false, reason: "last_line" };
+
+  await prisma.$transaction([
+    prisma.purchaseAllocation.delete({ where: { id } }),
+    prisma.purchase.update({
+      where: { id: allocation.purchaseId },
+      data: { amount: { decrement: allocation.amount } },
+    }),
+  ]);
+  await cleanupOrphanedAllocations();
+
+  revalidateAll();
+  revalidatePath("/tax-invoices");
+  return { ok: true };
+}

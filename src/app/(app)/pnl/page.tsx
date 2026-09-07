@@ -1,14 +1,15 @@
 import Link from "next/link";
 import { getSalePnlRows, groupByMonth, groupByParty } from "@/lib/pnl";
 import { getParties } from "@/lib/parties";
-import { formatDate, formatPartyLabel } from "@/lib/format";
+import { formatDate, formatPartyLabel, monthRange } from "@/lib/format";
 import { PnlSummaryTable, PnlBlTable } from "@/components/PnlTables";
 import { getCurrentUserFresh } from "@/lib/session";
 import { PartySearchFormField } from "@/components/PartySearchFormField";
+import { DateModeFilterFields } from "@/components/DateModeFilterFields";
 
 export const dynamic = "force-dynamic";
 
-type SP = Promise<{ view?: string; start?: string; end?: string; party?: string }>;
+type SP = Promise<{ view?: string; mode?: string; month?: string; start?: string; end?: string; party?: string }>;
 
 const TABS = [
   { key: "month", label: "월별 손익" },
@@ -42,17 +43,31 @@ export default async function PnlPage({ searchParams }: { searchParams: SP }) {
 
   const sp = await searchParams;
   const view = sp.view === "party" ? "party" : sp.view === "bl" ? "bl" : "month";
+  // 일반전표·관세전표와 같은 월/일 조회 방식(2026-09-07 요청) — "월"이면 그 달 전체를 한 번에
+  // 고르고, "일"이면 예전처럼 시작일·종료일을 따로 고른다.
+  const mode = sp.mode === "month" ? "month" : "day";
+  const month = sp.month ?? "";
   const start = sp.start ?? "";
   const end = sp.end ?? "";
   const partyId = sp.party ?? "";
 
+  const range = mode === "month" && month ? monthRange(month) : { start, end };
+
   const [rows, parties] = await Promise.all([
-    getSalePnlRows({ start: start || undefined, end: end || undefined, partyId: partyId || undefined }),
+    getSalePnlRows({ start: range.start || undefined, end: range.end || undefined, partyId: partyId || undefined }),
     getParties(),
   ]);
 
-  const filterActive = Boolean(start || end || partyId);
+  const filterActive = Boolean(range.start || range.end || partyId);
   const selectedParty = parties.find((p) => p.id === partyId);
+
+  // "보고서 다운로드"(인쇄용 HTML) 머리말에 쓸 조회조건 요약 — 화면 상단 필터 요약과 같은 값이다.
+  const reportMeta = {
+    corpName: process.env.BAROBILL_CORPNAME ?? "",
+    generatedByEmail: user.email,
+    periodLabel: range.start || range.end ? `${range.start || "처음"} ~ ${range.end || "지금"}` : "전체 기간",
+    partyFilterLabel: selectedParty ? formatPartyLabel(selectedParty.code, selectedParty.name) : null,
+  };
 
   return (
     <div className="flex flex-col gap-6">
@@ -64,24 +79,7 @@ export default async function PnlPage({ searchParams }: { searchParams: SP }) {
           충분히 빠르다(세금계산서/입출금내역처럼 외부 API를 부르는 화면과 다른 점). */}
       <form method="get" className="card flex flex-wrap items-end gap-3 p-4">
         <input type="hidden" name="view" value={view} />
-        <div className="flex flex-col gap-1">
-          <label className="text-xs text-muted">시작일</label>
-          <input
-            type="date"
-            name="start"
-            defaultValue={start}
-            className="rounded-md border border-border bg-surface px-2 py-1.5 text-sm text-fg"
-          />
-        </div>
-        <div className="flex flex-col gap-1">
-          <label className="text-xs text-muted">종료일</label>
-          <input
-            type="date"
-            name="end"
-            defaultValue={end}
-            className="rounded-md border border-border bg-surface px-2 py-1.5 text-sm text-fg"
-          />
-        </div>
+        <DateModeFilterFields defaultMode={mode} defaultMonth={month} defaultStart={start} defaultEnd={end} />
         <div className="flex flex-col gap-1">
           <label className="text-xs text-muted">거래처</label>
           <PartySearchFormField
@@ -108,7 +106,7 @@ export default async function PnlPage({ searchParams }: { searchParams: SP }) {
         )}
         {filterActive && (
           <span className="text-xs text-muted">
-            {start || "처음"} ~ {end || "지금"}
+            {range.start || "처음"} ~ {range.end || "지금"}
             {selectedParty && ` · ${formatPartyLabel(selectedParty.code, selectedParty.name)}`}
           </span>
         )}
@@ -118,7 +116,7 @@ export default async function PnlPage({ searchParams }: { searchParams: SP }) {
         {TABS.map((t) => (
           <Link
             key={t.key}
-            href={`/pnl${buildQuery({ view: t.key, start, end, party: partyId })}`}
+            href={`/pnl${buildQuery({ view: t.key, mode, month, start, end, party: partyId })}`}
             className={`rounded-t-md px-4 py-2 text-sm ${
               view === t.key
                 ? "border border-b-0 border-border bg-surface font-medium text-fg"
@@ -132,7 +130,13 @@ export default async function PnlPage({ searchParams }: { searchParams: SP }) {
 
       <div className="card overflow-x-auto p-4">
         {view === "month" && (
-          <PnlSummaryTable rows={groupByMonth(rows)} labelHeader="월" downloadLabel="월별손익" />
+          <PnlSummaryTable
+            rows={groupByMonth(rows)}
+            labelHeader="월"
+            downloadLabel="월별손익"
+            reportTitle="월별 손익 보고서"
+            reportMeta={reportMeta}
+          />
         )}
         {view === "party" && (
           <PnlSummaryTable
@@ -140,6 +144,8 @@ export default async function PnlPage({ searchParams }: { searchParams: SP }) {
             labelHeader="거래처명"
             codeHeader="거래처코드"
             downloadLabel="거래처별손익"
+            reportTitle="거래처별 손익 보고서"
+            reportMeta={reportMeta}
           />
         )}
         {view === "bl" && (
@@ -155,6 +161,7 @@ export default async function PnlPage({ searchParams }: { searchParams: SP }) {
               purchaseAmount: r.purchaseAmount,
               profit: r.profit,
             }))}
+            reportMeta={reportMeta}
           />
         )}
 

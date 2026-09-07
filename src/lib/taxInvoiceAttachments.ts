@@ -2,6 +2,7 @@ import { prisma } from "@/lib/prisma";
 import type { TaxInvoiceDirection } from "@/lib/barobill";
 import { formatDate } from "@/lib/format";
 import { deleteUploadedFile } from "@/lib/fileStorageActions";
+import { isUnissuedLabel } from "@/lib/unissuedLabels";
 
 export type AttachmentStatus = {
   blNo: string | null;
@@ -59,12 +60,21 @@ async function findVoucherByNtsSendKey(ntsSendKey: string): Promise<ExactVoucher
 
   const purchase = await prisma.purchase.findFirst({
     where: { ntsSendKey },
-    include: { party: true, allocations: { select: { blNo: true } } },
+    include: {
+      party: true,
+      // id 오름차순(cuid라 생성 순서와 거의 같다) — orderBy 없이 Postgres에 맡기면 순서가
+      // 보장되지 않아, 다른 배분을 금액만 갱신해도(예: 인보이스 재첨부 반영) 대표 B/L이
+      // 예고 없이 바뀔 수 있다(실제로 W/F 조정 줄이 대표로 튀어나온 적이 있다, 2026-09-07).
+      allocations: { select: { id: true, blNo: true }, orderBy: { id: "asc" } },
+    },
   });
   if (purchase) {
-    // 빈 blNo는 세지 않는다 — 세금계산서 미발행분(W/F 등)은 특정 B/L에 속하지 않아 blNo가
-    // 빈 문자열이다. 그걸 세면 "외 N건"이 실제 B/L 수보다 하나 많게 나온다.
-    const blNos = [...new Set(purchase.allocations.map((x) => x.blNo).filter(Boolean))];
+    // 빈 blNo·미발행 사유(W/F 등)는 세지 않는다 — 세금계산서 미발행분은 특정 B/L에 속하지
+    // 않는데, 그걸 세면 "외 N건"이 실제 B/L 수보다 하나 많아지고(원래 있던 문제), blNo 칸에
+    // 그 사유 문구가 그대로 들어간 옛 데이터는 그 문구 자체가 대표 B/L처럼 보일 수도 있다.
+    const blNos = [
+      ...new Set(purchase.allocations.map((x) => x.blNo).filter((v) => Boolean(v) && !isUnissuedLabel(v))),
+    ];
     if (blNos.length > 0) {
       return {
         blNo: blNos[0],
