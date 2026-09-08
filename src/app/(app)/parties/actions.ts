@@ -287,6 +287,9 @@ export async function updatePartyContact(input: {
   ]);
 
   revalidatePath("/parties");
+  // 담당자 이메일은 세금계산서 열람권한을 좌우하므로, 세금계산서 화면(2026-09-07 "담당자
+  // 지정" 기능으로 그 화면에서도 바로 수정할 수 있게 됨)도 함께 갱신한다.
+  revalidatePath("/tax-invoices");
   return { ok: true, contactName, contactPhone, email };
 }
 

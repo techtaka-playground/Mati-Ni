@@ -20,7 +20,9 @@ import {
   getRegistrationDetail,
   type TaxInvoiceEditHistoryEntry,
   type RegistrationDetail,
+  type PartyContactInfo,
 } from "@/app/(app)/tax-invoices/actions";
+import { PartyContactEditButton } from "@/components/PartyContactEditButton";
 import { extractPurchaseStatementPdf } from "@/app/(app)/purchases/actions";
 import { fileToBase64 } from "@/lib/clientFile";
 import { formatAmount, commaInput, numOf, formatBizNo, bizNoDigits } from "@/lib/format";
@@ -445,6 +447,10 @@ export function TaxInvoiceSearchForm({
   const [numbers, setNumbers] = useState<Record<string, string>>({});
   // 사업자등록번호(숫자만) → 거래처 코드. 거래처를 "[0001] 거래처명"으로 보여주기 위함.
   const [partyCodes, setPartyCodes] = useState<Record<string, string>>({});
+  // 사업자등록번호(숫자만) → 담당자 지정 현재값. 세금계산서 원문엔 이메일이 없어도(거래처
+  // 이메일 열은 흔히 "-") 여기서 지정한 이메일(또는 같은 이메일 그룹)로 열람 권한을 준다
+  // (hasCorpNumAccess, 2026-09-07 "담당자 지정" 기능).
+  const [partyContacts, setPartyContacts] = useState<Record<string, PartyContactInfo>>({});
   const [truncated, setTruncated] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pending, startTransition] = useTransition();
@@ -555,6 +561,7 @@ export function TaxInvoiceSearchForm({
       setRows(result.rows);
       setNumbers(result.numbers);
       setPartyCodes(result.partyCodes);
+      setPartyContacts(result.partyContacts);
       setTruncated(result.truncated);
       setSelectedKeys(new Set());
       setLastUpdatedAt(new Date());
@@ -582,6 +589,7 @@ export function TaxInvoiceSearchForm({
       setRows(result.rows);
       setNumbers(result.numbers);
       setPartyCodes(result.partyCodes);
+      setPartyContacts(result.partyContacts);
       setTruncated(false);
       setError(null);
       setLastUpdatedAt(new Date());
@@ -2005,6 +2013,38 @@ export function TaxInvoiceSearchForm({
   }
 
   // 등록된 행의 B/L 표시 — 여러 B/L에 걸쳐 있으면 "외 N건"을 붙이고, 누르면 상세 팝업이 뜬다.
+  // "담당자" 칸 — 세금계산서 원문 자체엔 이메일이 없는(거래처 이메일 열이 "-") 경우가
+  // 많아서, 여기서 지정한 이메일(Party.email)로 열람 권한을 준다(hasCorpNumAccess).
+  // ensurePartiesFromTaxInvoiceRows가 조회 시점에 항상 먼저 돌아서 Party는 이미 있다고 볼 수
+  // 있지만, 혹시 못 찾은 경우(bizNo 형식 문제 등)엔 지정 자체를 할 수 없어 "-"만 보여준다.
+  function renderContactCell(corpNum: string) {
+    const key = bizNoDigits(corpNum);
+    const contact = partyContacts[key];
+    if (!contact) return <span className="text-xs text-muted">-</span>;
+    return (
+      <div className="flex items-center gap-1.5 whitespace-nowrap">
+        <span className={contact.email ? "text-fg" : "text-xs text-muted"}>{contact.email || "미지정"}</span>
+        {isAdmin && (
+          <PartyContactEditButton
+            party={{
+              id: contact.id,
+              name: contact.name,
+              contactName: contact.contactName,
+              contactPhone: contact.contactPhone,
+              email: contact.email,
+            }}
+            onSaved={(result) =>
+              setPartyContacts((prev) => ({
+                ...prev,
+                [key]: { ...prev[key], ...result },
+              }))
+            }
+          />
+        )}
+      </div>
+    );
+  }
+
   function renderBlNoButton(r: TaxInvoiceRow, attachment: AttachmentStatus) {
     const extra = attachment.blCount > 1 ? ` 외 ${attachment.blCount - 1}건` : "";
     return (
@@ -2116,6 +2156,7 @@ export function TaxInvoiceSearchForm({
         <td className="max-w-[160px] truncate py-2 pr-3 text-muted" title={r.counterpartEmail || undefined}>
           {r.counterpartEmail || "-"}
         </td>
+        <td className="py-2 pr-3">{renderContactCell(r.counterpartCorpNum)}</td>
         <td className="py-2 pr-3 text-right num text-fg">{formatAmount(r.amountTotal)}</td>
         <td className="py-2 pr-3 text-right num text-muted">{formatAmount(r.taxTotal)}</td>
         <td className="py-2 pr-3 text-right num font-medium text-fg">{formatAmount(r.totalAmount)}</td>
@@ -2287,6 +2328,7 @@ export function TaxInvoiceSearchForm({
           <td className="max-w-[160px] truncate py-2 pr-3 text-muted" title={first.counterpartEmail || undefined}>
             {first.counterpartEmail || "-"}
           </td>
+          <td className="py-2 pr-3">{renderContactCell(first.counterpartCorpNum)}</td>
           <td className="py-2 pr-3 text-right num text-fg">{formatAmount(sum.amountTotal)}</td>
           <td className="py-2 pr-3 text-right num text-muted">{formatAmount(sum.taxTotal)}</td>
           <td className="py-2 pr-3 text-right num font-medium text-fg">{formatAmount(sum.totalAmount)}</td>
@@ -2630,6 +2672,9 @@ export function TaxInvoiceSearchForm({
                 {/* 바로빌 조회로 받은 건에만 있다(엑셀 업로드본·저장된 기록에는 없어 "-") — 정렬
                     대상에서 뺀 이유도 같다. */}
                 <th className="py-2 pr-3">거래처 이메일</th>
+                {/* 세금계산서 원문 이메일과 달리 우리가 직접 지정하는 값이라 정렬 대상에서 뺐다
+                    (Party.email, hasCorpNumAccess — 2026-09-07 "담당자 지정" 기능). */}
+                <th className="py-2 pr-3">담당자</th>
                 <SortableTh label="공급가액" sortKey="amountTotal" state={sort} onSort={handleSort} align="right" />
                 <SortableTh label="세액" sortKey="taxTotal" state={sort} onSort={handleSort} align="right" />
                 <SortableTh label="합계금액" sortKey="totalAmount" state={sort} onSort={handleSort} align="right" />

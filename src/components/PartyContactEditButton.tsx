@@ -34,7 +34,16 @@ function diffLines(e: PartyContactEditHistoryEntry): string[] {
 // 거래처 담당자 정보(담당자명·연락처·이메일)를 팝업에서 수정한다. 세 값이 모두 비어있던
 // 상태에서 처음 채우는 것은 "초기설정"으로 자동 기록되고 사유를 묻지 않는다 — 그 뒤 수정은
 // 사유가 필수이고, 수정 전 값이 이력에 남아 팝업에서 바로 확인할 수 있다.
-export function PartyContactEditButton({ party }: { party: Party }) {
+export function PartyContactEditButton({
+  party,
+  onSaved,
+}: {
+  party: Party;
+  // 저장 직후 새 값을 그대로 넘겨준다 — 세금계산서 화면처럼 목록을 서버에서 다시 불러오지
+  // 않고 클라이언트 상태만 들고 있는 곳에서, 페이지 전체를 다시 조회하지 않고 그 자리에서
+  // 값을 갱신할 수 있게(2026-09-07, "담당자 지정" 기능).
+  onSaved?: (result: { contactName: string | null; contactPhone: string | null; email: string | null }) => void;
+}) {
   const [open, setOpen] = useState(false);
   const [contactName, setContactName] = useState(party.contactName ?? "");
   const [contactPhone, setContactPhone] = useState(party.contactPhone ?? "");
@@ -72,6 +81,7 @@ export function PartyContactEditButton({ party }: { party: Party }) {
         setError(result.message);
         return;
       }
+      onSaved?.({ contactName: result.contactName, contactPhone: result.contactPhone, email: result.email });
       setOpen(false);
     } catch {
       setError("저장 중 오류가 발생했습니다.");

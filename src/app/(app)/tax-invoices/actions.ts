@@ -34,6 +34,7 @@ export type SearchTaxInvoicesResult =
       truncated: boolean;
       numbers: Record<string, string>;
       partyCodes: Record<string, string>;
+      partyContacts: Record<string, PartyContactInfo>;
     }
   | { ok: false; message: string };
 
@@ -51,6 +52,40 @@ async function getPartyCodesByBizNo(rows: TaxInvoiceRow[]): Promise<Record<strin
   const map: Record<string, string> = {};
   for (const p of parties) {
     if (p.bizNo && p.code) map[bizNoDigits(p.bizNo)] = p.code;
+  }
+  return map;
+}
+
+export type PartyContactInfo = {
+  id: string;
+  name: string;
+  contactName: string | null;
+  contactPhone: string | null;
+  email: string | null; // "담당자 지정" — 이 값이 있어야 그 이메일(또는 같은 그룹)로 이 거래처
+  // 세금계산서를 볼 수 있다(hasCorpNumAccess 참고). 세금계산서 원문 자체의 이메일(r.counterpartEmail,
+  // 흔히 비어 있음)과는 다른 값이다.
+};
+
+// 목록에 뜬 사업자등록번호 각각의 "담당자 지정" 현재값 — 화면에서 바로 지정/수정할 수 있게
+// PartyContactEditButton에 넘겨준다(2026-09-07). searchTaxInvoices 시점엔 이미
+// ensurePartiesFromTaxInvoiceRows가 먼저 실행돼 있어 Party가 없는 경우는 없다.
+async function getPartyContactsByBizNo(rows: TaxInvoiceRow[]): Promise<Record<string, PartyContactInfo>> {
+  const bizNos = [...new Set(rows.map((r) => formatBizNo(r.counterpartCorpNum)).filter(Boolean))];
+  if (bizNos.length === 0) return {};
+  const parties = await prisma.party.findMany({
+    where: { bizNo: { in: bizNos } },
+    select: { id: true, bizNo: true, name: true, contactName: true, contactPhone: true, email: true },
+  });
+  const map: Record<string, PartyContactInfo> = {};
+  for (const p of parties) {
+    if (!p.bizNo) continue;
+    map[bizNoDigits(p.bizNo)] = {
+      id: p.id,
+      name: p.name,
+      contactName: p.contactName,
+      contactPhone: p.contactPhone,
+      email: p.email,
+    };
   }
   return map;
 }
@@ -142,7 +177,8 @@ export async function searchTaxInvoices(input: {
     const visible = await filterRowsByAccess(merged, user);
     const numbers = await assignTaxInvoiceNumbers(input.direction, visible);
     const partyCodes = await getPartyCodesByBizNo(visible);
-    return { ok: true, rows: visible, truncated, numbers, partyCodes };
+    const partyContacts = await getPartyContactsByBizNo(visible);
+    return { ok: true, rows: visible, truncated, numbers, partyCodes, partyContacts };
   } catch (err) {
     // 바로빌 조회 자체가 실패해도(자격정보 미설정 등) 저장된 업로드 내역만으로는 보여줄 수 있다.
     if (saved.length > 0) {
@@ -157,7 +193,8 @@ export async function searchTaxInvoices(input: {
       const visible = await filterRowsByAccess(saved, user);
       const numbers = await assignTaxInvoiceNumbers(input.direction, visible);
       const partyCodes = await getPartyCodesByBizNo(visible);
-      return { ok: true, rows: visible, truncated: false, numbers, partyCodes };
+      const partyContacts = await getPartyContactsByBizNo(visible);
+      return { ok: true, rows: visible, truncated: false, numbers, partyCodes, partyContacts };
     }
     return { ok: false, message: err instanceof Error ? err.message : "조회 중 오류가 발생했습니다." };
   }
@@ -170,6 +207,7 @@ export type UploadTaxInvoiceExcelResult =
       rows: TaxInvoiceRow[];
       numbers: Record<string, string>;
       partyCodes: Record<string, string>;
+      partyContacts: Record<string, PartyContactInfo>;
     }
   | { ok: false; message: string };
 
@@ -204,7 +242,8 @@ export async function uploadTaxInvoiceExcel(base64: string): Promise<UploadTaxIn
     const visible = await filterRowsByAccess(rows, user);
     const numbers = await assignTaxInvoiceNumbers(direction, visible);
     const partyCodes = await getPartyCodesByBizNo(visible);
-    return { ok: true, direction, rows: visible, numbers, partyCodes };
+    const partyContacts = await getPartyContactsByBizNo(visible);
+    return { ok: true, direction, rows: visible, numbers, partyCodes, partyContacts };
   } catch (err) {
     return { ok: false, message: err instanceof Error ? err.message : "엑셀 파일을 처리하지 못했습니다." };
   }
