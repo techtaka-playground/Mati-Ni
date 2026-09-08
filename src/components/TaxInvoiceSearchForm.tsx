@@ -2220,7 +2220,18 @@ export function TaxInvoiceSearchForm({
               <button
                 type="button"
                 disabled={registeringKeys.has(r.ntsSendKey)}
-                onClick={() => openConfirmModal(r, direction, blNoInputs[r.ntsSendKey] ?? attachment?.blNo ?? "")}
+                onClick={() =>
+                  // 아직 아무것도 첨부·입력한 적 없으면(blNoInputs·attachment 둘 다 비어있으면)
+                  // 비고란 텍스트("B/L:LAXOE-260137" 등)에서 정규식으로 1차 추출해 미리 채워둔다
+                  // — 인보이스 파일을 먼저 첨부해야만 자동 채움이 되던 것을, "등록" 버튼만 눌러도
+                  // 되게 확장(2026-09-08). 실제 문서 인식(더 신뢰도 높음)은 팝업 안에서 파일을
+                  // 첨부하면 그때 덮어쓴다(handleAttachFile과 동일한 우선순위).
+                  openConfirmModal(
+                    r,
+                    direction,
+                    blNoInputs[r.ntsSendKey] ?? attachment?.blNo ?? extractBlNoFromRemark(r.remark1)
+                  )
+                }
                 className="text-xs text-accent hover:underline disabled:cursor-not-allowed disabled:text-muted disabled:no-underline"
               >
                 {registeringKeys.has(r.ntsSendKey) ? "등록 중..." : "등록"}
