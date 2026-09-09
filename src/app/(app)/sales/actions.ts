@@ -8,12 +8,41 @@ import { extractSaleInvoice, type ExtractedSaleInvoice, type ExtractResult } fro
 import { requireLoggedIn } from "@/lib/session";
 import { resetOrphanedTaxInvoiceAttachments } from "@/lib/taxInvoiceAttachments";
 import { cleanupOrphanedAllocations } from "@/lib/bankAllocation";
+import { parsePurchaseStatement } from "@/lib/purchaseStatementParser";
+import { parseArgoInvoice } from "@/lib/argoInvoiceParser";
+import { parseAirInvoice } from "@/lib/airInvoiceParser";
+import { parseStatementOfAccount } from "@/lib/statementOfAccountParser";
+
+// 이 오프라인 파서들(다건명세서·해외 파트너 명세서 등)은 전부 매입(비용) 쪽 양식이다 — 매출
+// 등록 화면에 실수로 매입 명세서를 첨부했을 때(2026-09-09, "일반전표 매출로 열었는데 해외
+// 명세서를 올려서 인식 실패" 사례) "PDF를 못 읽었다"는 막연한 오류 대신 정확한 안내를 주기
+// 위해서만 쓴다 — 그 결과(lines)를 매출로 만들지는 않는다(매출은 B/L 1건=1줄만 가능).
+async function looksLikePurchaseStatement(buffer: Buffer): Promise<boolean> {
+  try {
+    if ((await parsePurchaseStatement(buffer)).lines.length > 0) return true;
+    if ((await parseArgoInvoice(buffer)).lines.length > 0) return true;
+    if ((await parseAirInvoice(buffer)).lines.length > 0) return true;
+    if ((await parseStatementOfAccount(buffer)).lines.length > 0) return true;
+  } catch {
+    // 못 읽어도 이 안내 목적으로는 실패 취급하면 충분하다 — 아래 일반 오류로 넘어간다.
+  }
+  return false;
+}
 
 export async function extractSaleInvoicePdf(base64: string): Promise<ExtractResult<ExtractedSaleInvoice>> {
   await requireLoggedIn();
   try {
     return { ok: true, data: await extractSaleInvoice(base64) };
   } catch {
+    const buffer = Buffer.from(base64, "base64");
+    if (await looksLikePurchaseStatement(buffer)) {
+      return {
+        ok: false,
+        message:
+          "이 PDF는 매입(비용) 명세서로 보입니다. 구분을 \"매입\"으로 바꾼 뒤, 인보이스 첨부 옆의 " +
+          "\"다건명세서 업로드\"를 사용해주세요.",
+      };
+    }
     return { ok: false, message: "PDF에서 정보를 추출하지 못했습니다. 값을 직접 입력해주세요." };
   }
 }

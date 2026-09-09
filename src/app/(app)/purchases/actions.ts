@@ -14,6 +14,7 @@ import {
 import { parsePurchaseStatement } from "@/lib/purchaseStatementParser";
 import { parseArgoInvoice } from "@/lib/argoInvoiceParser";
 import { parseAirInvoice } from "@/lib/airInvoiceParser";
+import { parseStatementOfAccount } from "@/lib/statementOfAccountParser";
 import { requireLoggedIn } from "@/lib/session";
 import { resetOrphanedTaxInvoiceAttachments } from "@/lib/taxInvoiceAttachments";
 import { cleanupOrphanedAllocations } from "@/lib/bankAllocation";
@@ -34,16 +35,20 @@ export async function extractPurchaseInvoicePdf(
 export type ExtractedPurchaseStatementSmart = Omit<ExtractedPurchaseStatement, "lines"> & {
   method: "offline" | "ai";
   lines: (ExtractedPurchaseStatement["lines"][number] & { vat?: number; supplyAmount?: number })[];
+  // 해외 파트너 명세서(statementOfAccountParser)에서만 채워진다 — 그 문서에 찍힌 통화
+  // (USD/AUD 등). 국내 양식·AI 추출은 항상 KRW라 없음(undefined).
+  currency?: string | null;
 };
 
 // House No/Master No별로 여러 화물이 나열된 매입 명세서(지출결의서 등) 또는 B/L 1건짜리
 // 단건 인보이스(관세 등) 추출.
 // 1) 먼저 pdf-parse로 텍스트만 뽑아 규칙 기반으로 읽는다(API 키 불필요) — 지출결의서 양식
 //    (`parsePurchaseStatement`) → 해상 단건 INVOICE(`parseArgoInvoice`) → 항공 단건
-//    INVOICE(`parseAirInvoice`) 순으로 시도한다. 각 파서는 자기 양식이 아니면 빈 배열을
-//    돌려주므로 순서대로 이어 붙이면 되고, 새 정형 양식이 생기면 여기 하나 더 추가한다.
-// 2) 둘 다 한 줄도 못 찾으면(지원하지 않는 다른 양식) — ANTHROPIC_API_KEY가 있을 때만 —
-//    Claude로 추출을 한 번 더 시도한다. 셋 다 실패하면 사용자가 직접 입력해야 한다.
+//    INVOICE(`parseAirInvoice`) → 해외 파트너 명세서(`parseStatementOfAccount`) 순으로
+//    시도한다. 각 파서는 자기 양식이 아니면 빈 배열을 돌려주므로 순서대로 이어 붙이면 되고,
+//    새 정형 양식이 생기면 여기 하나 더 추가한다.
+// 2) 넷 다 한 줄도 못 찾으면(지원하지 않는 다른 양식) — ANTHROPIC_API_KEY가 있을 때만 —
+//    Claude로 추출을 한 번 더 시도한다. 다 실패하면 사용자가 직접 입력해야 한다.
 export async function extractPurchaseStatementPdf(
   base64: string
 ): Promise<ExtractResult<ExtractedPurchaseStatementSmart>> {
@@ -62,6 +67,12 @@ export async function extractPurchaseStatementPdf(
     const airInvoice = await parseAirInvoice(buffer);
     if (airInvoice.lines.length > 0) {
       return { ok: true, data: { ...airInvoice, method: "offline" } };
+    }
+    // 해외 파트너 정산 명세서("STATEMENT OF ACCOUNT") — 금액이 원화가 아니라 그 파트너의
+    // 통화로 찍혀 있다(2026-09-09).
+    const foreignStatement = await parseStatementOfAccount(buffer);
+    if (foreignStatement.lines.length > 0) {
+      return { ok: true, data: { ...foreignStatement, method: "offline" } };
     }
   } catch {
     // 이 PDF는 지원하는 정형 명세서 양식이 아님 — 아래에서 AI 추출로 넘어간다.

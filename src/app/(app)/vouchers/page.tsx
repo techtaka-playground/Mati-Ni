@@ -21,7 +21,32 @@ import { getCurrentUserFresh } from "@/lib/session";
 
 export const dynamic = "force-dynamic";
 
-type SP = Promise<{ start?: string; end?: string; month?: string; mode?: string; kind?: string }>;
+type SP = Promise<{ start?: string; end?: string; month?: string; mode?: string; kind?: string; cur?: string }>;
+
+// 손익조회 탭(월별/B/L별/거래처별)과 같은 형태로 통화별로도 걸러 볼 수 있게 한다(2026-09-09
+// 요청) — 매출·매입 구분은 그대로 두고(요청에서 제외됨) 통화만 추가한다. 원화(KRW)만 늘
+// 고정으로 두고, 그 외 외화는 실제로 그 통화의 전표가 하나라도 생기면 그때부터 탭에
+// 나타난다(2026-09-09 후속 요청 — "엔화는 아직 실적이 없으니 하드코딩하지 말고, 생기면
+// 나오게 해달라"). 수기기입(VoucherQuickEntry)에서 고를 수 있는 통화와 같은 순서·이름이다.
+const CURRENCY_LABELS: Record<string, string> = {
+  USD: "달러",
+  JPY: "엔화",
+  EUR: "유로",
+  CNY: "위안",
+  AUD: "호주달러",
+  HKD: "홍콩달러",
+  GBP: "파운드",
+};
+const CURRENCY_ORDER = ["USD", "JPY", "EUR", "CNY", "AUD", "HKD", "GBP"] as const;
+
+function buildVoucherQuery(params: Record<string, string | undefined>): string {
+  const qs = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) {
+    if (v) qs.set(k, v);
+  }
+  const s = qs.toString();
+  return s ? `?${s}` : "";
+}
 
 function toPendingRequestInfo(
   r: { id: string; reason: string; requestedByEmail: string; createdAt: Date } | undefined
@@ -46,21 +71,38 @@ export default async function VouchersPage({ searchParams }: { searchParams: SP 
   const sp = await searchParams;
   const mode = sp.mode === "month" ? "month" : "day";
   const kind = sp.kind === "sale" || sp.kind === "purchase" ? sp.kind : "all";
+  const allowedCurrencies: readonly string[] = ["KRW", ...CURRENCY_ORDER];
+  const cur = sp.cur && allowedCurrencies.includes(sp.cur) ? sp.cur : "all";
   const start = sp.start ?? "";
   const end = sp.end ?? "";
   const month = sp.month ?? "";
 
   const range = mode === "month" && month ? monthRange(month) : { start, end };
-  const filterActive = Boolean(range.start || range.end || kind !== "all");
+  const filterActive = Boolean(range.start || range.end || kind !== "all" || cur !== "all");
   const dateFilter = { start: range.start || undefined, end: range.end || undefined };
 
-  const [sales, purchases, parties, saleOptions, pendingRequests] = await Promise.all([
-    kind === "purchase" ? Promise.resolve([]) : getSalesWithPnl(dateFilter),
-    kind === "sale" ? Promise.resolve([]) : getPurchasesWithAllocations(dateFilter),
-    getParties(),
-    getSaleOptions(),
-    prisma.voucherUnconfirmRequest.findMany({ where: { status: "pending" } }),
+  const [sales, purchases, parties, saleOptions, pendingRequests, saleCurrencies, purchaseCurrencies] =
+    await Promise.all([
+      kind === "purchase" ? Promise.resolve([]) : getSalesWithPnl(dateFilter),
+      kind === "sale" ? Promise.resolve([]) : getPurchasesWithAllocations(dateFilter),
+      getParties(),
+      getSaleOptions(),
+      prisma.voucherUnconfirmRequest.findMany({ where: { status: "pending" } }),
+      // 통화 탭에 어떤 외화를 보여줄지는 지금 걸린 기간·구분 필터와 무관하게, 그 통화의
+      // 전표가 시스템 어디엔가 하나라도 있으면 결정한다 — 필터를 바꿀 때마다 탭이 있다 없다
+      // 하면 헷갈리기 때문(2026-09-09, "생성되면 나오게" 요청).
+      prisma.sale.findMany({ distinct: ["currency"], select: { currency: true } }),
+      prisma.purchase.findMany({ distinct: ["currency"], select: { currency: true } }),
+    ]);
+  const existingCurrencies = new Set([
+    ...saleCurrencies.map((s) => s.currency),
+    ...purchaseCurrencies.map((p) => p.currency),
   ]);
+  const currencyTabs = [
+    { key: "all", label: "전체" },
+    { key: "KRW", label: "원화" },
+    ...CURRENCY_ORDER.filter((c) => existingCurrencies.has(c)).map((c) => ({ key: c, label: CURRENCY_LABELS[c] })),
+  ];
   // 전표(kind+id) 하나당 대기 중인 해제 요청은 최대 1건이라 그대로 맵으로 만든다.
   const pendingRequestByVoucher = new Map(pendingRequests.map((r) => [`${r.kind}-${r.voucherId}`, r]));
 
@@ -202,6 +244,7 @@ export default async function VouchersPage({ searchParams }: { searchParams: SP 
     if (a.id !== b.id) return a.id < b.id ? -1 : 1;
     return a.blIndex - b.blIndex;
   });
+  const filteredRows = cur === "all" ? rows : rows.filter((r) => r.currency === cur);
 
   return (
     <div className="flex flex-col gap-6">
@@ -241,11 +284,31 @@ export default async function VouchersPage({ searchParams }: { searchParams: SP 
         )}
       </form>
 
-      <div className="card overflow-x-auto p-4">
-        <VoucherTable rows={rows} parties={parties} isAdmin={user.role === "admin"} />
+      {/* 손익조회의 월별/B/L별/거래처별 탭과 같은 형태 — 통화별로 걸러 본다(2026-09-09).
+          매출·매입 구분(위 "구분" 필터)은 그대로 두고 통화만 별도로 추가한다. */}
+      <div className="flex gap-1 border-b border-border">
+        {currencyTabs.map((t) => (
+          <Link
+            key={t.key}
+            href={`/vouchers${buildVoucherQuery({ mode, month, start, end, kind, cur: t.key === "all" ? undefined : t.key })}`}
+            className={`rounded-t-md px-4 py-2 text-sm ${
+              cur === t.key
+                ? "border border-b-0 border-border bg-surface font-medium text-fg"
+                : "text-muted hover:text-fg"
+            }`}
+          >
+            {t.label}
+          </Link>
+        ))}
+      </div>
 
-        {rows.length === 0 && (
-          <div className="py-8 text-center text-sm text-muted">등록된 전표가 없습니다.</div>
+      <div className="card overflow-x-auto p-4">
+        <VoucherTable rows={filteredRows} parties={parties} isAdmin={user.role === "admin"} />
+
+        {filteredRows.length === 0 && (
+          <div className="py-8 text-center text-sm text-muted">
+            {cur === "all" ? "등록된 전표가 없습니다." : "이 통화로 등록된 전표가 없습니다."}
+          </div>
         )}
       </div>
     </div>

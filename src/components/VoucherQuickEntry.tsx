@@ -2,12 +2,13 @@
 
 import { useRef, useState, useTransition } from "react";
 import { createSale, extractSaleInvoicePdf } from "@/app/(app)/sales/actions";
-import { createPurchase, extractPurchaseInvoicePdf } from "@/app/(app)/purchases/actions";
+import { createPurchase, extractPurchaseInvoicePdf, extractPurchaseStatementPdf } from "@/app/(app)/purchases/actions";
 import { ensurePartyByName } from "@/app/(app)/parties/actions";
 import { commaInput, numOf } from "@/lib/format";
 import { PdfUploadField, type PdfMeta } from "@/components/PdfUploadField";
-import { PurchaseStatementQuickUpload } from "@/components/PurchaseStatementQuickUpload";
+import { PurchaseStatementQuickUpload, type PurchaseStatementQuickUploadHandle } from "@/components/PurchaseStatementQuickUpload";
 import { saveUploadedPdf } from "@/lib/fileStorageActions";
+import { fileToBase64 } from "@/lib/clientFile";
 import type { ExtractedSaleInvoice, ExtractedPurchaseInvoice } from "@/lib/invoiceExtract";
 import { PartySearchSelect, type PartyOption } from "@/components/PartySearchSelect";
 
@@ -56,6 +57,11 @@ export function VoucherQuickEntry({
   const [savedFile, setSavedFile] = useState<string | null>(null);
   const [pending, startTransition] = useTransition();
   const dateRef = useRef<HTMLInputElement>(null);
+  // 매입 첨부칸 하나로 단건 인보이스·다건 명세서를 모두 받는다(2026-09-09, "파일 선택해서
+  // 올려도 다건명세서처럼 인식되게 해달라"는 요청 — 전엔 "다건명세서 업로드"가 별도 버튼이었다).
+  const [purchaseAttachPending, setPurchaseAttachPending] = useState(false);
+  const [purchaseAttachError, setPurchaseAttachError] = useState<string | null>(null);
+  const statementRef = useRef<PurchaseStatementQuickUploadHandle>(null);
 
   const amount = numOf(amountDisplay);
   const fxAmount = numOf(fxAmountDisplay);
@@ -92,6 +98,36 @@ export function VoucherQuickEntry({
     if (d.amount != null) setAmountDisplay(commaInput(String(d.amount)));
     if (d.note) setNote(d.note);
     await applyPartyHint(d.partyName, meta, d.amount, d.date);
+  }
+
+  // House No/Master No별로 여러 화물이 나열된 명세서인지 먼저 확인한다(API 호출 없는 순수
+  // 규칙 기반 파서라 매번 시도해도 비용이 없다) — 여러 줄이 인식되면 PurchaseStatementQuickUpload의
+  // 미리보기 팝업을 그대로 연다. 그 양식이 아니면(빈 배열) 기존처럼 1건짜리 인보이스 AI
+  // 추출로 넘어간다.
+  async function handlePurchaseFileChange(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    setPurchaseAttachError(null);
+    setPurchaseAttachPending(true);
+    try {
+      const base64 = await fileToBase64(file);
+      const statement = await extractPurchaseStatementPdf(base64);
+      if (statement.ok && statement.data.lines.length > 0) {
+        await statementRef.current?.openFromExtracted(statement.data);
+        return;
+      }
+      const single = await extractPurchaseInvoicePdf(base64);
+      if (!single.ok) {
+        setPurchaseAttachError(single.message);
+        return;
+      }
+      await applyExtractedPurchase(single.data, { base64, filename: file.name });
+    } catch {
+      setPurchaseAttachError("PDF 처리 중 오류가 발생했습니다.");
+    } finally {
+      setPurchaseAttachPending(false);
+    }
   }
 
   async function applyPartyHint(
@@ -321,14 +357,25 @@ export function VoucherQuickEntry({
                       <PdfUploadField extractAction={extractSaleInvoicePdf} onExtracted={applyExtractedSale} label="" />
                     )}
                     {direction === "purchase" && (
-                      <PdfUploadField
-                        extractAction={extractPurchaseInvoicePdf}
-                        onExtracted={applyExtractedPurchase}
-                        label=""
-                      />
+                      <div className="flex flex-col gap-1">
+                        <input
+                          type="file"
+                          accept="application/pdf"
+                          onChange={handlePurchaseFileChange}
+                          disabled={purchaseAttachPending}
+                          className="text-xs text-fg file:mr-2 file:rounded-md file:border-0 file:bg-gray-95 file:px-2 file:py-1 file:text-xs"
+                        />
+                        {purchaseAttachPending && <span className="text-xs text-muted">PDF 분석 중...</span>}
+                        {purchaseAttachError && <span className="text-xs text-neg">{purchaseAttachError}</span>}
+                      </div>
                     )}
                     {direction === "purchase" && (
-                      <PurchaseStatementQuickUpload parties={partyList} saleOptions={saleOptions} onRegistered={() => {}} />
+                      <PurchaseStatementQuickUpload
+                        ref={statementRef}
+                        parties={partyList}
+                        saleOptions={saleOptions}
+                        onRegistered={() => {}}
+                      />
                     )}
                   </div>
                 </div>
