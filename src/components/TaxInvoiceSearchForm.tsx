@@ -1153,11 +1153,18 @@ export function TaxInvoiceSearchForm({
           }))
           .filter((a) => a.label)
       : null;
-    // 새 파일을 첨부해서 배분에도 반영될 수 있으면(매입만), 실제로 반영하기 전에 무엇이
-    // 바뀌는지 요약해 보여주고 확인을 받는다(2026-09-07 요청, 처음엔 window.confirm을
-    // 썼는데 브라우저 기본창이라 못생겨서 자체 팝업으로 바꿨다) — 취소하면 아무것도
-    // 저장하지 않는다.
-    if (editModal.direction === "purchase" && editModal.file && editModal.extract && editModal.extract.lines.length > 0) {
+    // 새 파일을 첨부해서 실제 전표에도 반영될 수 있으면(매입 배분, 매출은 B/L별 추가 전표
+    // 생성), 실제로 반영하기 전에 무엇이 바뀌는지 요약해 보여주고 확인을 받는다(2026-09-07
+    // 요청, 처음엔 window.confirm을 썼는데 브라우저 기본창이라 못생겨서 자체 팝업으로 바꿨다.
+    // 2026-09-10: 매출도 여러 B/L이 인식되면 같은 방식으로 미리 보여주게 확장) — 취소하면
+    // 아무것도 저장하지 않는다. 매출은 인식된 줄이 1건뿐이면(가장 흔한 단건 인보이스 재첨부)
+    // 어차피 반영할 내용이 없으니 미리보기 없이 그대로 저장한다.
+    if (
+      editModal.file &&
+      editModal.extract &&
+      editModal.extract.lines.length > 0 &&
+      (editModal.direction === "purchase" || editModal.extract.lines.length > 1)
+    ) {
       const rows = buildReflectPreviewRows(editModal.detail, editModal.extract.lines, manualAdjustments);
       setReflectConfirm({ rows, manualAdjustments });
       return;
@@ -1211,10 +1218,11 @@ export function TaxInvoiceSearchForm({
           });
           return;
         }
+        const noun = editModal.direction === "sales" ? "매출 전표" : "배분";
         setAllocationReflectNotice(
           r.status === "applied"
-            ? { ok: true, text: `배분에 반영됐습니다 (수정 ${r.updated}건, 추가 ${r.created}건).` }
-            : { ok: false, text: `배분에는 반영되지 않았습니다 — ${r.reason}` }
+            ? { ok: true, text: `${noun}에 반영됐습니다 (수정 ${r.updated}건, 추가 ${r.created}건).` }
+            : { ok: false, text: `${noun}에는 반영되지 않았습니다 — ${r.reason}` }
         );
       } else {
         setAllocationReflectNotice(null);
@@ -3928,8 +3936,14 @@ export function TaxInvoiceSearchForm({
       {reflectConfirm && (
         <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/40 p-4">
           <div className="card flex max-h-[80vh] w-full max-w-md flex-col gap-4 p-6">
-            <h3 className="text-lg font-semibold text-fg">배분 반영 확인</h3>
-            <p className="text-sm text-muted">다음과 같이 실제 배분에 반영합니다.</p>
+            <h3 className="text-lg font-semibold text-fg">
+              {editModal?.direction === "sales" ? "매출 반영 확인" : "배분 반영 확인"}
+            </h3>
+            <p className="text-sm text-muted">
+              {editModal?.direction === "sales"
+                ? "다음과 같이 매출 전표에 반영합니다 — 새 B/L은 같은 승인번호를 공유하는 새 매출로 추가됩니다."
+                : "다음과 같이 실제 배분에 반영합니다."}
+            </p>
             <div className="flex flex-col gap-1 overflow-y-auto rounded-xl bg-gray-95 px-4 py-3 text-sm">
               {reflectConfirm.rows.map((r, i) => (
                 <span

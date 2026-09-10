@@ -507,6 +507,10 @@ export type ReapplyAllocationsResult =
         suggestedAmount: number; // newBlTotal과 매입 총액의 차이 — 조정 줄 합계에 넣으면 딱 맞는 값
         existingAdjustments: { label: string; amount: number }[]; // 기존 조정 줄 전부(없으면 빈 배열)
       };
+      // 매출 재첨부가 "인식된 줄이 1건뿐이라 반영할 게 없다"로 건너뛴 경우에만 true — 이건
+      // 실패가 아니라 흔한 정상 경로(단건 인보이스 재첨부)라 화면에 "반영 안 됨" 안내를
+      // 띄우면 오히려 혼란만 준다. 호출부가 이걸 보고 조용히 넘어간다(2026-09-10).
+      silent?: boolean;
     };
 
 async function reapplyPurchaseAllocationsFromFile(
@@ -642,6 +646,73 @@ async function reapplyPurchaseAllocationsFromFile(
   };
 }
 
+// 매출 쪽 "재첨부 반영" — 매입과 달리 매출은 B/L 1건 = Sale 1행이라 "배분"이라는 개념이
+// 없다. 그래서 새 파일에서 여러 B/L이 인식되면, 지금 등록된 B/L과 일치하는 줄은 그 Sale의
+// 금액만 갱신하고, 나머지 B/L들은 **새 매출 전표를 그만큼 만들어** 반영한다(같은 승인번호를
+// 공유하는 여러 Sale — getRegistrationDetail의 매출 분기가 이미 이 형태를 지원하고 있었다).
+// 매입처럼 "조정 줄"(W/F·부가세 등) 개념이 없어 차액 계산도 필요 없다 — 인식된 그대로 반영.
+// 2026-09-10, "새 파일에 B/L이 여러 건이면 차액이 나오고 B/L별로 안분돼야 하는 거 아니냐"는
+// 지적에 따라 추가(그때까지는 매출 쪽이 이 작업 범위에서 통째로 빠져 있었다).
+async function reapplySaleFromFile(ntsSendKey: string, fileBase64: string): Promise<ReapplyAllocationsResult> {
+  const sale = await prisma.sale.findFirst({ where: { ntsSendKey } });
+  if (!sale) return { status: "skipped", reason: "이 승인번호로 등록된 매출 전표를 찾지 못했습니다." };
+  if (sale.settlementConfirmedAt) {
+    return { status: "skipped", reason: "이미 확정된 매출은 반영하지 않았습니다." };
+  }
+
+  const extracted = await extractPurchaseStatementPdf(fileBase64);
+  if (!extracted.ok) {
+    return { status: "skipped", reason: `새 파일에서 B/L·금액을 읽지 못해 반영하지 않았습니다 (${extracted.message}).` };
+  }
+  const newLines = extracted.data.lines
+    .map((l) => ({ blNo: l.refNo.trim(), amount: l.supplyAmount ?? l.amount }))
+    .filter((l) => l.blNo);
+  if (newLines.length <= 1) {
+    // 단건이면 반영할 "나머지 B/L"이 없다 — B/L 텍스트 자체는 위쪽 로직(newBlNo)이 이미
+    // 처리하므로 흔한 정상 경로다. silent라 호출부가 조용히 넘어간다.
+    return { status: "skipped", reason: "단건으로 인식돼 별도 반영할 내용이 없습니다.", silent: true };
+  }
+
+  const matchIdx = newLines.findIndex((l) => l.blNo === sale.blNo);
+  if (matchIdx === -1) {
+    return { status: "skipped", reason: `새 파일에 기존 B/L(${sale.blNo})이 없어 반영하지 않았습니다.` };
+  }
+  const matchedLine = newLines[matchIdx];
+  const otherLines = newLines.filter((_, i) => i !== matchIdx);
+
+  // 다른 줄의 B/L이 이미 어딘가에 매출로 등록돼 있으면(이중 계상 방지) 새로 만들지 않고
+  // 건너뛴다 — findDuplicateVoucherMessage와 같은 목적.
+  const otherBlNos = otherLines.map((l) => l.blNo);
+  const existingSales = otherBlNos.length
+    ? await prisma.sale.findMany({ where: { blNo: { in: otherBlNos } }, select: { blNo: true } })
+    : [];
+  const existingBlNoSet = new Set(existingSales.map((s) => s.blNo));
+  const toCreate = otherLines.filter((l) => !existingBlNoSet.has(l.blNo));
+
+  await prisma.$transaction(async (tx) => {
+    await tx.sale.update({ where: { id: sale.id }, data: { amount: Math.round(matchedLine.amount) } });
+    for (const l of toCreate) {
+      const created = await tx.sale.create({
+        data: {
+          blNo: l.blNo,
+          date: sale.date,
+          partyId: sale.partyId,
+          amount: Math.round(l.amount),
+          note: sale.note,
+          // getRegistrationDetail의 매출 분기가 이미 "같은 승인번호를 공유하는 Sale 여러 행"을
+          // 전제로 짜여 있다 — 이 값 덕분에 이 새 매출도 같은 승인번호로 다시 열어 수정할 수
+          // 있고, 전표 화면에서 세금계산서 등록분으로 잠긴다(locked).
+          ntsSendKey: sale.ntsSendKey,
+        },
+      });
+      await tx.purchaseAllocation.updateMany({ where: { blNo: l.blNo, saleId: null }, data: { saleId: created.id } });
+      await tx.customsAdvance.updateMany({ where: { blNo: l.blNo, saleId: null }, data: { saleId: created.id } });
+    }
+  });
+
+  return { status: "applied", updated: 1, created: toCreate.length };
+}
+
 export async function editApprovedTaxInvoice(input: {
   ntsSendKeys: string[];
   direction: TaxInvoiceDirection;
@@ -693,15 +764,18 @@ export async function editApprovedTaxInvoice(input: {
     if (!saved.ok) return { ok: false, message: saved.message };
     newFileName = saved.filename;
 
-    // 재발행 인보이스를 다시 첨부했으면 그 안의 B/L·금액도 배분에 반영해본다(매입만 —
-    // 매출은 B/L마다 별도 Sale 행이라 구조가 달라 범위 밖이다). 반영했는지 건너뛰었는지는
-    // 결과에 그대로 담아 화면에 보여준다 — 조용히 넘어가면 사용자가 이유를 알 수 없다.
+    // 재발행 인보이스를 다시 첨부했으면 그 안의 B/L·금액도 실제 전표에 반영해본다. 반영했는지
+    // 건너뛰었는지는 결과에 그대로 담아 화면에 보여준다 — 조용히 넘어가면 사용자가 이유를
+    // 알 수 없다(단, 매출 쪽 "단건 인식"은 흔한 정상 경로라 조용히 넘어간다 — silent 참고).
     if (input.direction === "purchase" && input.ntsSendKeys.length === 1) {
       allocationReflect = await reapplyPurchaseAllocationsFromFile(
         input.ntsSendKeys[0],
         input.file.base64,
         input.manualAdjustments
       );
+    } else if (input.direction === "sales") {
+      const r = await reapplySaleFromFile(input.ntsSendKeys[0], input.file.base64);
+      if (!(r.status === "skipped" && r.silent)) allocationReflect = r;
     }
   }
 
