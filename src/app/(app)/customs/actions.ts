@@ -20,6 +20,7 @@ import {
   cleanupOrphanedAllocations,
   type MatchCandidate,
 } from "@/lib/bankAllocation";
+import { resetOrphanedTaxInvoiceAttachments } from "@/lib/taxInvoiceAttachments";
 
 // proxy.ts는 "로그인 됐는가"만 확인하므로, 관세전표 열람 권한은 Server Action 안에서도
 // 다시 확인한다(세금계산서 쪽 getTaxInvoiceUser와 같은 이유). resolveCustomsPartyId는 여기
@@ -154,12 +155,25 @@ export async function deleteCustomsAdvance(formData: FormData): Promise<DeleteAc
   const id = String(formData.get("id") ?? "");
   if (!id) return { ok: false, reason: "not_found" };
 
-  const existing = await prisma.customsAdvance.findUnique({ where: { id }, select: { settlementConfirmedAt: true } });
+  const existing = await prisma.customsAdvance.findUnique({
+    where: { id },
+    select: { settlementConfirmedAt: true, blNo: true, ntsSendKey: true },
+  });
   if (existing?.settlementConfirmedAt) return { ok: false, reason: "confirmed" };
 
   await prisma.customsAdvance.delete({ where: { id } });
   await cleanupOrphanedAllocations();
+
+  // 세금계산서에서 "관세전표"로 등록된 건이었다면, 그 등록 상태도 함께 초기화한다 — 안 그러면
+  // 전표는 지워졌는데 세금계산서 화면에는 여전히 "등록됨(확정)"으로 남는다. deletePurchase가
+  // 이미 매입 쪽에서 하는 것과 같은 처리인데, 관세대납 삭제에는 빠져 있던 것을 뒤늦게 맞춘다
+  // (2026-09-10, "관세전표 삭제했는데 세금계산서에 반영 안 됨" 제보).
+  if (existing?.ntsSendKey && existing.blNo) {
+    await resetOrphanedTaxInvoiceAttachments(existing.blNo, "purchase");
+  }
+
   revalidateAll();
+  revalidatePath("/tax-invoices");
   return { ok: true };
 }
 

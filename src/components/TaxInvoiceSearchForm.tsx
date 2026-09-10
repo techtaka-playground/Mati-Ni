@@ -3325,7 +3325,11 @@ export function TaxInvoiceSearchForm({
         const isTrouble = Boolean(confirmExtractError || mismatch);
         return (
           <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/40 p-4">
-            <div className="card flex w-full max-w-md flex-col gap-4 p-7">
+            {/* B/L이 여러 건이면 "인식된 내용" 목록이 길어져 화면(특히 작은 화면)보다 카드가
+                커질 수 있다 — 그러면 맨 아래 "확인" 버튼이 화면 밖으로 밀려 눌러지지 않는다.
+                카드 자체를 뷰포트 높이 안에서 스크롤되게 해서 항상 버튼까지 내려볼 수 있게
+                한다(2026-09-10). */}
+            <div className="card flex max-h-[85vh] w-full max-w-md flex-col gap-4 overflow-y-auto p-7">
               <h3 className="flex items-center gap-2 text-base font-semibold text-fg">
                 {isTrouble ? (
                   <IconAlertCircle className="h-5 w-5 text-neg" />
